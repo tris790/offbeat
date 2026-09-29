@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Offbeat
+GenericName=Music Player
+Comment=Fast, beautiful music player
+Exec=offbeat
+Icon=offbeat
+Terminal=false
+Categories=AudioVideo;Audio;Player;
+StartupWMClass=offbeat
