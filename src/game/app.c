@@ -161,8 +161,13 @@ struct App {
     b32  state_dirty;
     f64  now;
 
-    /* demo/screenshot script (OFFBEAT_DEMO) */
-    const char *demo;
+    /* demo/screenshot script (OFFBEAT_DEMO): a timeline, see run_demo */
+    const char *demo;          /* set while the script still has tokens to run */
+    char        demo_buf[2048];
+    const char *demo_cur;
+    u32         demo_frame;
+    char        demo_type[64]; /* text being typed into the palette */
+    u32         demo_typed;
 };
 
 /* ------------------------------------------------------------------------- */
@@ -2658,69 +2663,139 @@ static void draw_debug(App *app, f32 dt) {
 /* demo script (headless screenshots / smoke tests)                          */
 /* ------------------------------------------------------------------------- */
 
+static void demo_token(App *app, char *tok) {
+    if (strncmp(tok, "search=", 7) == 0) {
+        open_search(app, true);
+        u32 n = (u32)strlen(tok + 7);
+        memcpy(app->query, tok + 7, n);
+        app->query_len = n;
+        app->query_hash_done = 0;
+        run_search(app);
+    } else if (strncmp(tok, "tab=", 4) == 0) {
+        app->tab = (u32)atoi(tok + 4) % TAB_COUNT;
+    } else if (strncmp(tok, "play=", 5) == 0) {
+        play_index(app, atoi(tok + 5), 0, false);
+    } else if (strncmp(tok, "find=", 5) == 0) {
+        Search_Hit h;
+        if (search_tracks(app->lib, core_str(tok + 5), &h, 1)) {
+            for (u32 i = 0; i < app->queue_len; i++)
+                if (app->queue[i] == h.track) { play_index(app, (s32)i, 0, false); break; }
+        }
+    } else if (strncmp(tok, "artist=", 7) == 0) {
+        u32 ai = (u32)atoi(tok + 7);
+        if (ai < app->lib->artist_count) { app->tab = TAB_ARTISTS; app->artist_open = (s32)ai; }
+    } else if (strncmp(tok, "genre=", 6) == 0) {
+        u32 gi = (u32)atoi(tok + 6);
+        if (gi < app->lib->genre_count) { app->tab = TAB_GENRES; app->genre_open = (s32)gi; }
+    } else if (strncmp(tok, "queueartist=", 12) == 0) {
+        u32 ai = (u32)atoi(tok + 12);
+        if (ai < app->lib->artist_count)
+            queue_append_many(app, app->lib->artists[ai].tracks, app->lib->artists[ai].track_count);
+    } else if (strncmp(tok, "seek=", 5) == 0) {
+        player_seek(app->player, atof(tok + 5));
+    } else if (strcmp(tok, "pause") == 0) {
+        player_set_paused(app->player, true);
+    } else if (strcmp(tok, "palmenu") == 0) {
+        if (app->hit_count) {
+            open_menu(app, app->hits[0].track, -1, true);
+            app->menu_pos = vec2_make(400, 250);
+        }
+    } else if (strcmp(tok, "debug") == 0) {
+        app->settings.debug = true;
+    } else if (strcmp(tok, "settings") == 0) {
+        open_settings(app, true);
+    } else if (strncmp(tok, "browse", 6) == 0) {
+        open_settings(app, true);
+        open_browse(app, true);
+        if (tok[6] == '=') browse_to(app, tok + 7);
+    } else if (strncmp(tok, "folder=", 7) == 0) {
+        set_music_dir(app, tok + 7);
+    } else if (strncmp(tok, "theme=", 6) == 0) {
+        for (u32 i = 0; i < SETTINGS_THEME_COUNT; i++)
+            if (strcmp(SETTINGS_THEMES[i].id, tok + 6) == 0) { app->settings.theme = i; settings_theme_matrix(i, app->theme_m); }
+    } else if (strncmp(tok, "vis=", 4) == 0) {
+        for (u32 i = 0; i < VIS_COUNT; i++)
+            if (strcmp(SETTINGS_VIS_IDS[i], tok + 4) == 0) app->settings.vis = i;
+    } else if (strcmp(tok, "like") == 0) {
+        const Lib_Track *t = current_track(app);
+        if (t) set_liked(app, t->path_hash, true);
+    
+    } else if (strncmp(tok, "type=", 5) == 0) {
+        snprintf(app->demo_type, sizeof(app->demo_type), "%s", tok + 5);
+        app->demo_typed = 0;
+    } else if (strcmp(tok, "open") == 0) {
+        open_settings(app, false);
+        open_search(app, true);
+        app->query_len = 0;
+        app->query_hash_done = 0;
+        run_search(app);
+    } else if (strcmp(tok, "close") == 0) {
+        open_search(app, false);
+        open_settings(app, false);
+        app->menu = MENU_NONE;
+    } else if (strcmp(tok, "down") == 0) {
+        if (app->hit_count) app->hit_sel = (app->hit_sel + 1) % (s32)app->hit_count;
+    } else if (strcmp(tok, "enter") == 0) {
+        if (app->hit_count) search_play(app, app->hits[app->hit_sel].track, false);
+        open_search(app, false);
+    } else if (strcmp(tok, "menu") == 0) {
+        if (app->cur >= 0) open_menu(app, app->queue[app->cur], app->cur, false);
+        app->menu_pos = vec2_make(app->ui.size.x * 0.80f, app->ui.size.y * 0.30f);
+    } else if (strcmp(tok, "next") == 0) {
+        skip(app, +1);
+    } else if (strcmp(tok, "resume") == 0) {
+        player_set_paused(app->player, false);
+    } else if (strncmp(tok, "vol=", 4) == 0) {
+        app->volume = CORE_CLAMP((f32)atof(tok + 4), 0.0f, 1.0f);
+        player_set_volume(app->player, app->volume);
+        app->volume_toast = 1.2f;
+    } else if (strncmp(tok, "scroll=", 7) == 0) {
+        u32 which = (u32)atoi(tok + 7);
+        const char *colon = strchr(tok + 7, ':');
+        if (colon && which < CORE_ARRAY_COUNT(app->scroll)) {
+            app->queue_follow = false;
+            app->scroll[which].target = (f32)atof(colon + 1);
+        }
+    } else if (strcmp(tok, "tab") == 0) {
+        app->tab = (app->tab + 1) % TAB_COUNT;
+    }
+}
+
+/* OFFBEAT_DEMO is a timeline of ';'-separated tokens. "@N" waits until frame N
+   (counted from when the library is ready) before the tokens after it run, so a
+   single headless run can script a whole tour. "type=abc" types into the
+   palette, one character every 5 frames, and holds the timeline until done. */
 static void run_demo(App *app) {
     if (!app->demo || !app->lib) return;
-    const char *s = app->demo;
-    app->demo = 0;
-    char buf[512];
-    snprintf(buf, sizeof(buf), "%s", s);
-    for (char *tok = strtok(buf, ";"); tok; tok = strtok(0, ";")) {
-        if (strncmp(tok, "search=", 7) == 0) {
-            open_search(app, true);
-            u32 n = (u32)strlen(tok + 7);
-            memcpy(app->query, tok + 7, n);
-            app->query_len = n;
-            app->query_hash_done = 0;
-            run_search(app);
-        } else if (strncmp(tok, "tab=", 4) == 0) {
-            app->tab = (u32)atoi(tok + 4) % TAB_COUNT;
-        } else if (strncmp(tok, "play=", 5) == 0) {
-            play_index(app, atoi(tok + 5), 0, false);
-        } else if (strncmp(tok, "find=", 5) == 0) {
-            Search_Hit h;
-            if (search_tracks(app->lib, core_str(tok + 5), &h, 1)) {
-                for (u32 i = 0; i < app->queue_len; i++)
-                    if (app->queue[i] == h.track) { play_index(app, (s32)i, 0, false); break; }
-            }
-        } else if (strncmp(tok, "artist=", 7) == 0) {
-            u32 ai = (u32)atoi(tok + 7);
-            if (ai < app->lib->artist_count) { app->tab = TAB_ARTISTS; app->artist_open = (s32)ai; }
-        } else if (strncmp(tok, "genre=", 6) == 0) {
-            u32 gi = (u32)atoi(tok + 6);
-            if (gi < app->lib->genre_count) { app->tab = TAB_GENRES; app->genre_open = (s32)gi; }
-        } else if (strncmp(tok, "queueartist=", 12) == 0) {
-            u32 ai = (u32)atoi(tok + 12);
-            if (ai < app->lib->artist_count)
-                queue_append_many(app, app->lib->artists[ai].tracks, app->lib->artists[ai].track_count);
-        } else if (strncmp(tok, "seek=", 5) == 0) {
-            player_seek(app->player, atof(tok + 5));
-        } else if (strcmp(tok, "pause") == 0) {
-            player_set_paused(app->player, true);
-        } else if (strcmp(tok, "palmenu") == 0) {
-            if (app->hit_count) {
-                open_menu(app, app->hits[0].track, -1, true);
-                app->menu_pos = vec2_make(400, 250);
-            }
-        } else if (strcmp(tok, "debug") == 0) {
-            app->settings.debug = true;
-        } else if (strcmp(tok, "settings") == 0) {
-            open_settings(app, true);
-        } else if (strncmp(tok, "browse", 6) == 0) {
-            open_settings(app, true);
-            open_browse(app, true);
-            if (tok[6] == '=') browse_to(app, tok + 7);
-        } else if (strncmp(tok, "folder=", 7) == 0) {
-            set_music_dir(app, tok + 7);
-        } else if (strncmp(tok, "theme=", 6) == 0) {
-            for (u32 i = 0; i < SETTINGS_THEME_COUNT; i++)
-                if (strcmp(SETTINGS_THEMES[i].id, tok + 6) == 0) { app->settings.theme = i; settings_theme_matrix(i, app->theme_m); }
-        } else if (strncmp(tok, "vis=", 4) == 0) {
-            for (u32 i = 0; i < VIS_COUNT; i++)
-                if (strcmp(SETTINGS_VIS_IDS[i], tok + 4) == 0) app->settings.vis = i;
-        } else if (strcmp(tok, "like") == 0) {
-            const Lib_Track *t = current_track(app);
-            if (t) set_liked(app, t->path_hash, true);
+    if (!app->demo_cur) {
+        snprintf(app->demo_buf, sizeof(app->demo_buf), "%s", app->demo);
+        app->demo_cur = app->demo_buf;
+    }
+    app->demo_frame++;
+    if (app->demo_type[app->demo_typed]) {
+        if (!app->search_open) app->demo_type[0] = 0; /* palette closed: nothing to type into */
+        else {
+            if (app->demo_frame % 5 == 0 && app->query_len < sizeof(app->query))
+                app->query[app->query_len++] = (u8)app->demo_type[app->demo_typed++];
+            return;
         }
+    }
+    for (;;) {
+        while (*app->demo_cur == ';') app->demo_cur++;
+        if (!*app->demo_cur) { app->demo = 0; return; }
+        char *end = strchr(app->demo_cur, ';');
+        char tok[256];
+        u32 n = end ? (u32)(end - app->demo_cur) : (u32)strlen(app->demo_cur);
+        if (n >= sizeof(tok)) n = sizeof(tok) - 1;
+        memcpy(tok, app->demo_cur, n);
+        tok[n] = 0;
+        if (tok[0] == '@') {
+            if (app->demo_frame < (u32)atoi(tok + 1)) return;
+        } else {
+            demo_token(app, tok);
+        }
+        app->demo_cur += n;
+        if (app->demo_type[app->demo_typed]) return; /* typing started: hold */
     }
 }
 

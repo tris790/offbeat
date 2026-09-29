@@ -10,6 +10,10 @@
  * Headless screenshots (used for development/CI):
  *   OFFBEAT_SHOT=out.png [OFFBEAT_SHOT_FRAMES=90] [OFFBEAT_SIZE=1376x972]
  *   [OFFBEAT_DEMO="find=midnight;search=mid"] ./build/offbeat
+ *
+ * Headless recording (README gifs): every frame is written as raw RGBA to a
+ * file or fifo, at real-time pace (audio-driven visuals stay in sync):
+ *   OFFBEAT_REC=/tmp/rec.fifo OFFBEAT_SHOT_FRAMES=1800 ./build/offbeat
  */
 
 #include "core/types.h"
@@ -49,10 +53,12 @@ static void window_state_load(Core_Arena *arena, const char *path, u32 *w, u32 *
 int main(void)
 {
     const char *shot = platform_env("OFFBEAT_SHOT");
+    const char *rec = platform_env("OFFBEAT_REC");
+    b32 headless = shot || rec;
     u32 win_w = 1376, win_h = 972;
     b32 win_maximized = false;
     char state_path[1024] = {0};
-    if (!shot) {
+    if (!headless) {
         Core_Arena scratch;
         if (core_arena_init(&scratch, 1 << 20)) {
             window_state_path(&scratch, state_path, sizeof(state_path));
@@ -64,7 +70,7 @@ int main(void)
     u32 shot_frames = platform_env("OFFBEAT_SHOT_FRAMES") ? (u32)atoi(platform_env("OFFBEAT_SHOT_FRAMES")) : 90;
 
     u32 flags = PLATFORM_WINDOW_TRANSPARENT;
-    if (shot) {
+    if (headless) {
         flags |= PLATFORM_WINDOW_HEADLESS;
         setenv("OFFBEAT_MUTE", "1", 0); /* screenshots never make sound */
     }
@@ -88,13 +94,24 @@ int main(void)
         fprintf(stderr, "failed to create renderer\n");
         return 1;
     }
-    if (shot) core_renderer_use_offscreen(renderer, win_w, win_h);
+    if (headless) core_renderer_use_offscreen(renderer, win_w, win_h);
     else {
         platform_window_size(win, &win_w, &win_h);
         core_renderer_resize(renderer, win_w, win_h);
     }
 
     App *app = app_create(&arena, renderer, win);
+
+    FILE *rec_out = 0;
+    u8 *rec_px = 0;
+    if (rec) {
+        rec_out = fopen(rec, "wb");
+        if (!rec_out) {
+            fprintf(stderr, "cannot open %s\n", rec);
+            return 1;
+        }
+        rec_px = core_heap_alloc((u64)win_w * win_h * 4);
+    }
 
     Platform_Input input = {0};
     f64 last = platform_time_seconds();
@@ -103,12 +120,12 @@ int main(void)
     u32 restore_w = win_w, restore_h = win_h; /* last un-maximized size */
 
     while (!platform_window_should_close(win)) {
-        if (!busy && !shot) platform_wait_events(win, 0.5);
+        if (!busy && !headless) platform_wait_events(win, 0.5);
         platform_poll_events(win, &input);
 
         u32 w, h;
         platform_window_size(win, &w, &h);
-        if (!shot && (w != win_w || h != win_h)) {
+        if (!headless && (w != win_w || h != win_h)) {
             win_w = w;
             win_h = h;
             core_renderer_resize(renderer, win_w, win_h);
@@ -121,14 +138,21 @@ int main(void)
         f64 now = platform_time_seconds();
         f32 dt = (f32)(now - last);
         last = now;
-        if (shot) dt = 1.0f / 60.0f;       /* deterministic animation */
+        if (headless) dt = 1.0f / 60.0f;    /* deterministic animation */
         if (dt > 0.1f) dt = 0.1f;           /* after a sleep: no huge jumps */
 
         busy = app_frame(app, &input, dt, win_w, win_h);
         platform_swap_buffers(win);
         frame++;
 
-        if (shot) {
+        if (rec) {
+            core_renderer_read_pixels(renderer, win_w, win_h, rec_px);
+            if (fwrite(rec_px, 4, (u64)win_w * win_h, rec_out) != (u64)win_w * win_h) break;
+            /* real-time pace: the audio clock (positions, spectrum) is wall-clock */
+            f64 spare = (1.0 / 60.0) - (platform_time_seconds() - now);
+            if (spare > 0) platform_sleep(spare);
+            if (frame >= shot_frames) break;
+        } else if (shot) {
             /* let background loading (covers, audio) catch up between frames */
             platform_sleep(0.004);
             if (frame >= shot_frames) {
@@ -142,9 +166,10 @@ int main(void)
         }
     }
 
+    if (rec_out) fclose(rec_out);
     app_shutdown(app); /* also creates the config dir */
 
-    if (!shot && state_path[0]) {
+    if (!headless && state_path[0]) {
         char buf[64];
         int n = snprintf(buf, sizeof(buf), "size %u %u\nmaximized %u\n", restore_w, restore_h,
                          platform_window_is_maximized(win) ? 1u : 0u);
