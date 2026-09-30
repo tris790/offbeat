@@ -20,7 +20,7 @@ optional: it only fetches the small thumbnails shown in the result lists.
 - The dock at the bottom shows overall progress; hover (or click the arrow) to
   see every song, retry or remove one, pause, or clear the finished ones. A
   status pill at the top left of the player keeps it visible when the page is
-  closed.
+  closed. Click the pill to reopen the download page.
 
 Closing the page, or the app, never loses anything: the queue is saved on every
 change, a song that was mid-download goes back to *queued* and yt-dlp resumes

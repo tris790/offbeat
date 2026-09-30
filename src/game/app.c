@@ -3227,8 +3227,6 @@ b32 app_frame(App *app, const Platform_Input *in, f32 dt, u32 width, u32 height)
     /* ---- panel ---- */
     draw_panel(app, left_w, panel_w, H, playing);
 
-    handle_window_chrome(app, win, left_w);
-
     /* downloads: a status pill on the player screen, and the page itself above it */
     if (!modal && dlv_draw_status(app->dlv, ui, vec2_make(S(24), S(22)))) dlv_open(app->dlv, true);
     {
@@ -3238,6 +3236,8 @@ b32 app_frame(App *app, const Platform_Input *in, f32 dt, u32 width, u32 height)
         dlv_draw(app->dlv, ui, &df, &dout);
         if (dout.open_settings) open_settings(app, true);
     }
+    /* Floating download controls claim their clicks before window dragging. */
+    handle_window_chrome(app, win, left_w);
     if (downloads_take_finished(app->downloads)) app->rescan_at = app->now + 2.0; /* new songs show up in the library */
 
     ui_draw_effects(ui);

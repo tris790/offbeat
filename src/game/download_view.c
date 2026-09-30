@@ -1301,12 +1301,12 @@ b32 dlv_draw_status(Dl_View *v, Ui *ui, vec2 pos) {
     f32 w1 = ui_text_width(ui, ui->font_med, core_str(l1), S(14));
     f32 base_w = S(52) + w1 + S(18);
     f32 full_w = CORE_MAX(base_w, S(52) + CORE_MIN(ui_text_width(ui, ui->font, core_str(l2), S(12.5f)), S(260)) + S(18));
-    vec2 hp = vec2_make(pos.x, pos.y);
-    Ui_Interact it = ui_interact(ui, ui_id("dv.pill"), hp, vec2_make(v->pill_expand > 0.5f ? full_w : base_w, h), PLATFORM_CURSOR_HAND);
+    vec2 hp = vec2_make(pos.x, pos.y - (1 - a) * S(10));
+    vec2 sz = vec2_make(core_lerp(base_w, full_w, v->pill_expand), h + S(16) * v->pill_expand);
+    Ui_Interact it = ui_interact(ui, ui_id("dv.pill"), hp, sz, PLATFORM_CURSOR_HAND);
     v->pill_expand = ui_ease(ui, ui_id("dv.pill.x"), it.hovered && l2[0] ? 1.0f : 0.0f, 12.0f);
     f32 w = core_lerp(base_w, full_w, v->pill_expand);
-    hp.y -= (1 - a) * S(10);
-    vec2 sz = vec2_make(w, h + S(16) * v->pill_expand);
+    sz = vec2_make(w, h + S(16) * v->pill_expand);
     core_draw_shadow(r, vec2_make(hp.x, hp.y + S(6)), sz, S(20), S(20), UI_RGBA(0, 0, 0, 0.4f * a));
     Core_BoxStyle bg = { .radius = S(20), .fill = UI_RGBA(26, 22, 43, (0.9f + 0.05f * it.hover_t) * a),
                          .border = S(1), .border_color = UI_RGBA(255, 255, 255, (0.10f + 0.08f * it.hover_t) * a) };
