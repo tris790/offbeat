@@ -214,6 +214,12 @@ typedef struct {
 Platform_FileInfo platform_file_info(const char *path);
 /* mkdir -p */
 b32               platform_make_dirs(const char *path);
+/* Rename within one filesystem, replacing `to` if it exists. */
+b32               platform_file_rename(const char *from, const char *to);
+/* Delete a file. */
+b32               platform_file_remove(const char *path);
+/* Delete a directory and everything under it (never follows symlinks). */
+void              platform_remove_tree(const char *path);
 
 /* Recursive directory walk. Calls `visit` for every regular file (symlinks
    followed, hidden entries skipped). `visit` returns false to stop the walk. */
@@ -237,6 +243,32 @@ const u8   *platform_file_map(const char *path, u64 *out_size);
 
 /* Environment variable or 0. */
 const char *platform_env(const char *name);
+
+/* ---- child processes ----
+ *
+ * Just enough to drive command-line tools (yt-dlp, ffmpeg): start one with its
+ * stdout+stderr merged into a pipe, read it line by line, stop it. The child
+ * runs in its own process group so stopping it also stops whatever it spawned.
+ */
+
+typedef struct Platform_Process Platform_Process;
+
+/* Start `argv[0]` (looked up in PATH), argv NULL-terminated, stdin closed.
+   Returns 0 if it could not be started. */
+Platform_Process *platform_process_spawn(const char *const *argv);
+/* Next line of output without the line ending (truncated to `cap - 1` bytes),
+   waiting up to `timeout_s`. Returns its length (>= 0), -1 once the child has
+   closed its output, or -2 when the wait timed out. */
+s32               platform_process_read_line(Platform_Process *p, char *buf, u32 cap, f64 timeout_s);
+/* Ask the child (and its process group) to stop. Safe from any thread while
+   another thread is reading; the reader then sees end of output. */
+void              platform_process_kill(Platform_Process *p);
+/* Wait for exit and release the handle. Returns the exit status, or 128 + the
+   signal number if it was killed. */
+s32               platform_process_finish(Platform_Process *p);
+/* Resolve an executable: a path is checked as is, a bare name is searched in
+   PATH. Writes the full path to `out` and returns true when it is runnable. */
+b32               platform_find_executable(const char *name, char *out, u64 cap);
 
 /* Process memory as the OS sees it (resident set, and its anonymous part). */
 typedef struct { u64 rss; u64 rss_anon; u64 rss_file; } Platform_MemInfo;

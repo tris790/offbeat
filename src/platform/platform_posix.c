@@ -8,6 +8,9 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
+#include <signal.h>
+#include <spawn.h>
 #include <pthread.h>
 #include <sched.h>
 #include <stdio.h>
@@ -18,6 +21,7 @@
 #include <sys/stat.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -205,6 +209,30 @@ b32 platform_make_dirs(const char *path) {
 
 /* Iterative-recursive walk with a fixed path buffer; depth-limited so symlink
    loops can't run away. */
+b32 platform_file_rename(const char *from, const char *to) { return rename(from, to) == 0; }
+b32 platform_file_remove(const char *path) { return unlink(path) == 0; }
+
+void platform_remove_tree(const char *path) {
+    struct stat st;
+    if (lstat(path, &st) != 0) return;
+    if (S_ISDIR(st.st_mode)) {
+        DIR *d = opendir(path);
+        if (d) {
+            struct dirent *e;
+            while ((e = readdir(d))) {
+                if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+                char child[2048];
+                if (snprintf(child, sizeof(child), "%s/%s", path, e->d_name) >= (int)sizeof(child)) continue;
+                platform_remove_tree(child);
+            }
+            closedir(d);
+        }
+        rmdir(path);
+    } else {
+        unlink(path);
+    }
+}
+
 static b32 walk_rec(char *path, size_t len, u32 depth, Platform_WalkProc visit, void *user) {
     if (depth > 32) return true;
     DIR *dir = opendir(path);
@@ -352,4 +380,121 @@ Platform_MemInfo platform_mem_info(void) {
     }
     fclose(f);
     return m;
+}
+
+/* ---- child processes ---- */
+
+extern char **environ;
+
+struct Platform_Process {
+    pid_t pid;
+    int   fd;          /* read end of the merged stdout/stderr pipe */
+    b32   eof;
+    u32   len;         /* bytes buffered in `buf` */
+    char  buf[4096];
+};
+
+Platform_Process *platform_process_spawn(const char *const *argv) {
+    int fds[2];
+    if (pipe2(fds, O_CLOEXEC) != 0) return 0;
+
+    posix_spawn_file_actions_t fa;
+    posix_spawnattr_t at;
+    posix_spawn_file_actions_init(&fa);
+    posix_spawnattr_init(&at);
+    posix_spawn_file_actions_addopen(&fa, 0, "/dev/null", O_RDONLY, 0);
+    posix_spawn_file_actions_adddup2(&fa, fds[1], 1);
+    posix_spawn_file_actions_adddup2(&fa, fds[1], 2);
+    posix_spawnattr_setflags(&at, POSIX_SPAWN_SETPGROUP);
+    posix_spawnattr_setpgroup(&at, 0); /* its own group: kill() reaches grandchildren too */
+
+    pid_t pid = 0;
+    int rc = posix_spawnp(&pid, argv[0], &fa, &at, (char *const *)argv, environ);
+    posix_spawn_file_actions_destroy(&fa);
+    posix_spawnattr_destroy(&at);
+    close(fds[1]);
+    if (rc != 0) { close(fds[0]); return 0; }
+
+    Platform_Process *p = calloc(1, sizeof(*p));
+    if (!p) { kill(pid, SIGKILL); waitpid(pid, 0, 0); close(fds[0]); return 0; }
+    p->pid = pid;
+    p->fd = fds[0];
+    return p;
+}
+
+s32 platform_process_read_line(Platform_Process *p, char *buf, u32 cap, f64 timeout_s) {
+    f64 deadline = platform_time_seconds() + timeout_s;
+    for (;;) {
+        char *nl = memchr(p->buf, '\n', p->len);
+        if (nl || (p->eof && p->len) || p->len == sizeof(p->buf)) {
+            u32 n = nl ? (u32)(nl - p->buf) : p->len;      /* line length */
+            u32 used = nl ? n + 1 : n;                     /* bytes consumed */
+            u32 out = n;
+            while (out && p->buf[out - 1] == '\r') out--;
+            u32 copy = out < cap - 1 ? out : cap - 1;
+            memcpy(buf, p->buf, copy);
+            buf[copy] = 0;
+            memmove(p->buf, p->buf + used, p->len - used);
+            p->len -= used;
+            return (s32)copy;
+        }
+        if (p->eof) return -1;
+
+        f64 left = deadline - platform_time_seconds();
+        if (left < 0) left = 0;
+        struct pollfd pfd = { .fd = p->fd, .events = POLLIN };
+        int pr = poll(&pfd, 1, (int)(left * 1000.0));
+        if (pr < 0) { if (errno == EINTR) continue; p->eof = true; continue; }
+        if (pr == 0) return -2;
+        ssize_t got = read(p->fd, p->buf + p->len, sizeof(p->buf) - p->len);
+        if (got > 0) p->len += (u32)got;
+        else if (got == 0 || (errno != EINTR && errno != EAGAIN)) p->eof = true;
+    }
+}
+
+void platform_process_kill(Platform_Process *p) {
+    if (!p || p->pid <= 0) return;
+    kill(-p->pid, SIGTERM);
+}
+
+s32 platform_process_finish(Platform_Process *p) {
+    if (!p) return -1;
+    close(p->fd);
+    int status = 0;
+    while (waitpid(p->pid, &status, 0) < 0 && errno == EINTR) {}
+    s32 code = WIFEXITED(status) ? WEXITSTATUS(status) : WIFSIGNALED(status) ? 128 + WTERMSIG(status) : -1;
+    free(p);
+    return code;
+}
+
+static b32 is_runnable(const char *path) {
+    struct stat st;
+    return stat(path, &st) == 0 && S_ISREG(st.st_mode) && access(path, X_OK) == 0;
+}
+
+b32 platform_find_executable(const char *name, char *out, u64 cap) {
+    if (!name || !name[0]) return false;
+    if (strchr(name, '/')) {
+        if (!is_runnable(name) || strlen(name) >= cap) return false;
+        memcpy(out, name, strlen(name) + 1);
+        return true;
+    }
+    const char *path = getenv("PATH");
+    if (!path) path = "/usr/local/bin:/usr/bin:/bin";
+    while (*path) {
+        const char *end = strchr(path, ':');
+        size_t n = end ? (size_t)(end - path) : strlen(path);
+        char cand[1024];
+        if (n && n + strlen(name) + 2 < sizeof(cand)) {
+            memcpy(cand, path, n);
+            snprintf(cand + n, sizeof(cand) - n, "/%s", name);
+            if (is_runnable(cand) && strlen(cand) < cap) {
+                memcpy(out, cand, strlen(cand) + 1);
+                return true;
+            }
+        }
+        if (!end) break;
+        path = end + 1;
+    }
+    return false;
 }
