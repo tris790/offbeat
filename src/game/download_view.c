@@ -634,13 +634,14 @@ static b32 draw_results(Dl_View *v, Ui *ui, const Dlv_Frame *f, const Dl_SearchI
         }
     }
     v->sel = CORE_CLAMP(v->sel, 0, count ? (s32)count - 1 : 0);
+    /* The floating dock blocks wheel input as well as row interactions. */
+    b32 saved_in = ui->input_enabled;
+    ui->input_enabled = saved_in && live;
     f32 pos = scroll_update(ui, &v->scroll, lp, ls, content, row_h * 2.0f);
     u32 first = (u32)CORE_MAX(0.0f, floorf(pos / row_h));
     u32 last = CORE_MIN(count, first + (u32)(ls.y / row_h) + 2);
     core_clip_push(r, lp, ls);
 
-    b32 saved_in = ui->input_enabled;
-    ui->input_enabled = saved_in && live;
     f32 sel_y = ui_spring(ui, ui_id("dv.sel"), lp.y - pos + (f32)v->sel * row_h, 600, 44);
     if (count) {
         Core_BoxStyle sb = { .radius = S(11), .fill = UI_RGBA(255, 255, 255, 0.05f * a),
