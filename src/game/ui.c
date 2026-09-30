@@ -545,6 +545,61 @@ void ui_icon_minus(Ui *ui, vec2 c, f32 s, vec4 col) {
     core_draw_line(ui->r, vec2_make(c.x - h, c.y), vec2_make(c.x + h, c.y), th, col);
 }
 
+void ui_icon_download(Ui *ui, vec2 c, f32 s, vec4 col) {
+    f32 th = s * 0.095f;
+    vec2 top = vec2_make(c.x, c.y - s * 0.38f), tip = vec2_make(c.x, c.y + s * 0.12f);
+    core_draw_line(ui->r, top, tip, th, col);
+    arrow_head(ui, vec2_make(tip.x, tip.y + th * 0.4f), vec2_make(0, 1), s * 0.22f, th, col);
+    /* tray */
+    f32 x0 = c.x - s * 0.38f, x1 = c.x + s * 0.38f, y0 = c.y + s * 0.16f, y1 = c.y + s * 0.4f;
+    core_draw_line(ui->r, vec2_make(x0, y0), vec2_make(x0, y1), th, col);
+    core_draw_line(ui->r, vec2_make(x0, y1), vec2_make(x1, y1), th, col);
+    core_draw_line(ui->r, vec2_make(x1, y1), vec2_make(x1, y0), th, col);
+}
+
+void ui_icon_check(Ui *ui, vec2 c, f32 s, f32 t, vec4 col) {
+    f32 th = s * 0.11f;
+    vec2 a = vec2_make(c.x - s * 0.32f, c.y + s * 0.02f);
+    vec2 b = vec2_make(c.x - s * 0.1f, c.y + s * 0.24f);
+    vec2 d = vec2_make(c.x + s * 0.34f, c.y - s * 0.24f);
+    if (t <= 0) return;
+    f32 l1 = vec2_distance(a, b), l2 = vec2_distance(b, d);
+    f32 at = t * (l1 + l2);
+    if (at <= l1) {
+        core_draw_line(ui->r, a, vec2_lerp(a, b, at / l1), th, col);
+    } else {
+        core_draw_line(ui->r, a, b, th, col);
+        core_draw_line(ui->r, b, vec2_lerp(b, d, CORE_MIN(1.0f, (at - l1) / l2)), th, col);
+    }
+}
+
+void ui_icon_retry(Ui *ui, vec2 c, f32 s, vec4 col) {
+    f32 th = s * 0.095f, r = s * 0.32f;
+    f32 a0 = -CORE_PI * 0.1f, sweep = CORE_PI * 1.5f, end = a0 + sweep;
+    core_draw_arc(ui->r, c, r, th, a0, sweep, col);
+    vec2 tip = vec2_make(c.x + cosf(end) * r, c.y + sinf(end) * r);
+    arrow_head(ui, tip, vec2_make(-sinf(end), cosf(end)), s * 0.22f, th, col);
+}
+
+void ui_icon_chevron_down(Ui *ui, vec2 c, f32 s, vec4 col) {
+    f32 h = s * 0.3f, th = s * 0.1f;
+    core_draw_line(ui->r, vec2_make(c.x - h, c.y - h * 0.5f), vec2_make(c.x, c.y + h * 0.5f), th, col);
+    core_draw_line(ui->r, vec2_make(c.x, c.y + h * 0.5f), vec2_make(c.x + h, c.y - h * 0.5f), th, col);
+}
+
+void ui_icon_chevron_up(Ui *ui, vec2 c, f32 s, vec4 col) {
+    f32 h = s * 0.3f, th = s * 0.1f;
+    core_draw_line(ui->r, vec2_make(c.x - h, c.y + h * 0.5f), vec2_make(c.x, c.y - h * 0.5f), th, col);
+    core_draw_line(ui->r, vec2_make(c.x, c.y - h * 0.5f), vec2_make(c.x + h, c.y + h * 0.5f), th, col);
+}
+
+void ui_icon_warning(Ui *ui, vec2 c, f32 s, vec4 col) {
+    f32 th = s * 0.09f;
+    core_draw_circle_ex(ui->r, c, s * 0.42f, th, 0, col);
+    core_draw_line(ui->r, vec2_make(c.x, c.y - s * 0.2f), vec2_make(c.x, c.y + s * 0.04f), th, col);
+    core_draw_circle(ui->r, vec2_make(c.x, c.y + s * 0.22f), th * 0.65f, col);
+}
+
 void ui_icon_queue_next(Ui *ui, vec2 c, f32 s, vec4 col) {
     f32 th = s * 0.09f, h = s * 0.42f;
     for (u32 i = 0; i < 3; i++) {
@@ -568,17 +623,17 @@ void ui_icon_eq(Ui *ui, vec2 c, f32 s, const f32 *levels, vec4 col) {
     }
 }
 
-f32 ui_keycap(Ui *ui, Core_String label, f32 x, f32 cy, f32 h, Ui_Align align) {
+f32 ui_keycap(Ui *ui, Core_String label, f32 x, f32 cy, f32 h, Ui_Align align, f32 alpha) {
     f32 px = h * 0.56f;
     f32 tw = ui_text_width(ui, ui->font_mono, label, px);
     f32 w = CORE_MAX(tw + h * 0.62f, h * 1.05f);
     if (align == UI_ALIGN_RIGHT) x -= w;
     else if (align == UI_ALIGN_CENTER) x -= w * 0.5f;
     Core_BoxStyle st = {
-        .radius = S(5), .fill = UI_RGBA(255, 255, 255, 0.04f),
-        .border = S(1), .border_color = UI_RGBA(255, 255, 255, 0.16f),
+        .radius = S(5), .fill = UI_RGBA(255, 255, 255, 0.04f * alpha),
+        .border = S(1), .border_color = UI_RGBA(255, 255, 255, 0.16f * alpha),
     };
     core_draw_box(ui->r, vec2_make(x, cy - h * 0.5f), vec2_make(w, h), &st);
-    ui_text(ui, ui->font_mono, label, x + w * 0.5f, cy, px, UI_RGBA(210, 206, 228, 1), UI_ALIGN_CENTER, 0);
+    ui_text(ui, ui->font_mono, label, x + w * 0.5f, cy, px, UI_RGBA(210, 206, 228, alpha), UI_ALIGN_CENTER, 0);
     return w;
 }

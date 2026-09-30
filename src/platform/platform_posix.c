@@ -233,6 +233,8 @@ void platform_remove_tree(const char *path) {
     }
 }
 
+b32 platform_remove_dir_if_empty(const char *path) { return rmdir(path) == 0; }
+
 static b32 walk_rec(char *path, size_t len, u32 depth, Platform_WalkProc visit, void *user) {
     if (depth > 32) return true;
     DIR *dir = opendir(path);
@@ -390,6 +392,7 @@ struct Platform_Process {
     pid_t pid;
     int   fd;          /* read end of the merged stdout/stderr pipe */
     b32   eof;
+    f64   killed_at;   /* when platform_process_kill asked it to stop (0 = never) */
     u32   len;         /* bytes buffered in `buf` */
     char  buf[4096];
 };
@@ -440,7 +443,10 @@ s32 platform_process_read_line(Platform_Process *p, char *buf, u32 cap, f64 time
         }
         if (p->eof) return -1;
 
-        f64 left = deadline - platform_time_seconds();
+        f64 now = platform_time_seconds();
+        /* asked to stop but still talking: stop asking nicely */
+        if (p->killed_at > 0 && now - p->killed_at > 2.0) { kill(-p->pid, SIGKILL); p->killed_at = now + 1e9; }
+        f64 left = deadline - now;
         if (left < 0) left = 0;
         struct pollfd pfd = { .fd = p->fd, .events = POLLIN };
         int pr = poll(&pfd, 1, (int)(left * 1000.0));
@@ -455,6 +461,7 @@ s32 platform_process_read_line(Platform_Process *p, char *buf, u32 cap, f64 time
 void platform_process_kill(Platform_Process *p) {
     if (!p || p->pid <= 0) return;
     kill(-p->pid, SIGTERM);
+    if (p->killed_at == 0) p->killed_at = platform_time_seconds();
 }
 
 s32 platform_process_finish(Platform_Process *p) {

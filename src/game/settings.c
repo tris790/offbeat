@@ -22,6 +22,7 @@ void settings_default(Settings *s) {
     memset(s, 0, sizeof(*s));
     s->theme = 0;
     s->vis = VIS_SILK;
+    s->download_parallel = 2;
 }
 
 static u32 find_id(const char *v, u32 n, const char *(*get)(u32)) {
@@ -58,14 +59,20 @@ void settings_parse(Settings *s, Core_String text) {
             if (i != UINT32_MAX) s->vis = i;
         } else if (strcmp(key, "debug") == 0) {
             s->debug = atoi(val) != 0;
+        } else if (strcmp(key, "download_dir") == 0) {
+            snprintf(s->download_dir, sizeof(s->download_dir), "%s", val);
+        } else if (strcmp(key, "download_parallel") == 0) {
+            s->download_parallel = CORE_CLAMP((u32)atoi(val), 1u, 3u);
         }
     }
 }
 
 u64 settings_format(const Settings *s, char *buf, u64 cap) {
-    int n = snprintf(buf, cap, "offbeat-settings 1\nmusic_dir %s\ntheme %s\nvisualizer %s\ndebug %d\n",
+    int n = snprintf(buf, cap, "offbeat-settings 1\nmusic_dir %s\ntheme %s\nvisualizer %s\ndebug %d\n"
+                     "download_dir %s\ndownload_parallel %u\n",
                      s->music_dir, SETTINGS_THEMES[s->theme % SETTINGS_THEME_COUNT].id,
-                     SETTINGS_VIS_IDS[s->vis % VIS_COUNT], s->debug ? 1 : 0);
+                     SETTINGS_VIS_IDS[s->vis % VIS_COUNT], s->debug ? 1 : 0,
+                     s->download_dir, CORE_CLAMP(s->download_parallel, 1u, 3u));
     if (n < 0) return 0;
     return CORE_MIN((u64)n, cap ? cap - 1 : 0);
 }

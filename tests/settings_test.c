@@ -18,6 +18,7 @@ int main(void) {
     Settings s, t;
     settings_default(&s);
     CHECK(s.vis == VIS_SILK && s.theme == 0 && !s.debug && s.music_dir[0] == 0);
+    CHECK(s.download_dir[0] == 0 && s.download_parallel == 2);
 
     /* round trip */
     snprintf(s.music_dir, sizeof(s.music_dir), "/home/me/Music Folder/ünï");
@@ -28,6 +29,17 @@ int main(void) {
     settings_parse(&t, (Core_String){ .str = (u8 *)buf, .len = n });
     CHECK(strcmp(t.music_dir, s.music_dir) == 0);
     CHECK(t.theme == 4 && t.vis == VIS_BARS && t.debug);
+    CHECK(t.download_dir[0] == 0 && t.download_parallel == 2);
+    snprintf(s.download_dir, sizeof(s.download_dir), "/srv/dl folder/ünï");
+    s.download_parallel = 3;
+    n = settings_format(&s, buf, sizeof(buf));
+    settings_default(&t);
+    settings_parse(&t, (Core_String){ .str = (u8 *)buf, .len = n });
+    CHECK(strcmp(t.download_dir, s.download_dir) == 0 && t.download_parallel == 3);
+    settings_parse(&t, core_str("download_parallel 99\n"));
+    CHECK(t.download_parallel == 3);
+    settings_parse(&t, core_str("download_parallel 0\n"));
+    CHECK(t.download_parallel == 1);
 
     /* unknown keys and values are ignored; missing keys keep defaults */
     settings_default(&t);

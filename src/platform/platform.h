@@ -220,6 +220,8 @@ b32               platform_file_rename(const char *from, const char *to);
 b32               platform_file_remove(const char *path);
 /* Delete a directory and everything under it (never follows symlinks). */
 void              platform_remove_tree(const char *path);
+/* rmdir: removes `path` only if it is an empty directory (true when it did). */
+b32               platform_remove_dir_if_empty(const char *path);
 
 /* Recursive directory walk. Calls `visit` for every regular file (symlinks
    followed, hidden entries skipped). `visit` returns false to stop the walk. */

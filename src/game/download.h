@@ -13,7 +13,13 @@
  * a list the UI polls; a few worker threads each run one job at a time:
  *
  *   yt-dlp  -> <work>/<id>.mp3 + <id>.jpg        (audio + cover)
- *   ffmpeg  -> <dest>/<Artist>/<Title>.mp3       (all tags, cover attached)
+ *   ffmpeg  -> <folder>/<Title>.mp3              (all tags, cover attached)
+ *
+ * <folder> is part of the library: the folder the library already keeps that
+ * artist in (<music>/<Genre>/<Artist>), else a genre folder matching YouTube's
+ * genre tag, else <dest>/<Artist> (the "new artists" folder). A song the
+ * library already has (same artist, same title modulo "(2011 Remaster)" and
+ * the like) is never fetched twice.
  *
  * Jobs survive closing the app: the queue is written to a small text file on
  * every change, a job that was running comes back as queued, and yt-dlp keeps
@@ -69,6 +75,8 @@ typedef struct {
     char channel[DL_TEXT];      /* uploader; empty for artist lookups        */
     u32  duration_s;            /* 0 = unknown                               */
     u64  views;                 /* 0 = unknown                               */
+    u8   music;                 /* a YouTube Music song: real album/year tags */
+    char artist[DL_TEXT];       /* the song's artist, once known (see below) */
 } Dl_Result;
 
 typedef struct {
@@ -83,6 +91,7 @@ typedef struct {
 typedef struct {
     u32 total;                  /* jobs in the list                          */
     u32 queued, active, done, failed;
+    u32 session_done;           /* finished since the app started (done counts older ones too) */
     f32 progress;               /* 0..1 over the current batch               */
     u32 batch_total, batch_done;
     b32 paused;
@@ -98,15 +107,24 @@ Downloads *downloads_create(const char *state_path, const char *work_dir);
 /* Stops running downloads (they resume next time), saves, joins, frees. */
 void       downloads_destroy(Downloads *d);
 
-/* Where finished songs go (created on demand) and how many download at once. */
+/* Where songs of artists the library doesn't have yet go (created on demand)
+   and how many download at once. */
 void       downloads_configure(Downloads *d, const char *dest_dir, u32 parallel);
+/* The library's root: finished songs are filed into its artist folders. */
+void       downloads_set_library(Downloads *d, const char *music_dir);
 
 /* Look for yt-dlp and ffmpeg again (after the user installed them). */
 void       downloads_check_tools(Downloads *d);
 Dl_Tools   downloads_tools(Downloads *d);
 
 /* Start a search, cancelling any running one. Artist searches list the
-   artist's top songs (up to 100), song searches list video results. */
+   artist's top songs (up to 100); song searches list the best matching
+   YouTube Music songs (clean studio versions with full tags) followed by
+   YouTube video results (live versions, remixes, lyric videos, ...). The
+   same song released twice ("Hypnotize" / "Hypnotize (2007 Remaster)") is
+   listed once. YouTube Music hits come without an artist: it is looked up
+   right after and filled in (`Dl_Result.artist`, and the real title), which
+   may also drop a hit that turned out to be a duplicate. */
 void          downloads_search(Downloads *d, u32 kind, const char *query);
 void          downloads_search_cancel(Downloads *d);
 Dl_SearchInfo downloads_search_info(Downloads *d);
@@ -116,6 +134,11 @@ b32           downloads_result(Downloads *d, u32 index, Dl_Result *out);
    list was searched for; it is used until yt-dlp reports the real one. Skips
    songs already queued, running, or downloaded. Returns how many were added. */
 u32        downloads_enqueue(Downloads *d, const Dl_Result *results, u32 count, const char *artist_hint);
+
+/* Cheap per-frame view of the whole list (no strings), same order as
+   downloads_job(). Returns the number written. */
+typedef struct { u64 uid; u8 state, phase, attempts; f32 progress; } Dl_Brief;
+u32        downloads_briefs(Downloads *d, Dl_Brief *out, u32 max);
 
 Dl_Summary downloads_summary(Downloads *d);
 u32        downloads_job_count(Downloads *d);
@@ -128,6 +151,7 @@ void       downloads_retry(Downloads *d, u64 uid);        /* failed -> queued   
 void       downloads_retry_failed(Downloads *d);
 void       downloads_remove(Downloads *d, u64 uid);       /* cancels if running    */
 void       downloads_clear_finished(Downloads *d);        /* drops done + failed   */
+void       downloads_cancel_all(Downloads *d);            /* drops queued, stops running */
 /* Number of songs finished since the last call (the app rescans its library). */
 u32        downloads_take_finished(Downloads *d);
 
@@ -142,6 +166,18 @@ void dl_clean_channel(const char *channel, char *out, u32 cap);
 /* Video title -> song title: drops a leading "Artist - " and trailing
    "(Official Video)"-style tags. */
 void dl_clean_title(const char *title, const char *artist, char *out, u32 cap);
+/* Comparison key of a song title: lowercase letters and digits, without the
+   tags that only describe a release ("(2011 Remaster)", "[Explicit]",
+   "(feat. X)", " - Single Version", "(Official Video)") but keeping the ones
+   that make a different song ("(Live)", "(Acoustic)", "(Remix)"). */
+void dl_song_key(const char *title, char *out, u32 cap);
+/* Comparison key of an artist: primary artist, lowercase letters and digits,
+   no leading "the" ("The Notorious B.I.G." == "notorious big"). */
+void dl_artist_key(const char *artist, char *out, u32 cap);
+/* Could `lib_artist` be the artist of a result? `known` is what is known about
+   it (may be empty), `raw_title` the result's title (YouTube titles often say
+   "Artist - Song"). */
+b32  dl_artist_plausible(const char *lib_artist, const char *known, const char *raw_title);
 /* One path component: no separators/control characters, never empty, not "."
    or "..". */
 void dl_path_segment(const char *in, char *out, u32 cap);
@@ -152,6 +188,8 @@ void dl_dest_path(const char *dest_dir, const char *artist, const char *title, c
 b32  dl_parse_result_line(const char *line, Dl_Result *out);
 /* "OBP <downloaded> <total> <estimate>" -> fraction 0..1, or false if unknown. */
 b32  dl_parse_progress_line(const char *line, f32 *fraction);
+/* The lookup line for a YouTube Music hit: sets vid, artist, title, duration. */
+b32  dl_parse_enrich_line(const char *line, Dl_Result *out);
 /* yt-dlp's metadata line for a job; fills title/artist/album/genre/year/... */
 b32  dl_parse_meta_line(const char *line, Dl_Job *job);
 

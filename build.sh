@@ -6,6 +6,7 @@
 #   ./build.sh release    optimized build (gcc -O2)        -> build/offbeat
 #   ./build.sh asan       debug + address/UB sanitizers (gcc)
 #   ./build.sh test       unit tests (tcc)
+#   ./build.sh testasan   unit tests under address/UB sanitizers (gcc)
 #
 # App code (everything under src/ except third_party/) is compiled in a single
 # cc invocation, so new .c files are picked up automatically. Heavy third-party
@@ -83,10 +84,11 @@ case "$MODE" in
     release) CC="${CC:-gcc}"; OPT="-O2 -DNDEBUG" ;;
     asan)    CC="${CC:-gcc}"; OPT="-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer" ;;
     test)    CC="${CC:-tcc}"; OPT="-g" ;;
-    *) echo "unknown mode '$MODE' (use: debug | release | asan | test)" >&2; exit 2 ;;
+    testasan) CC="${CC:-gcc}"; OPT="-O1 -g -w -fsanitize=address,undefined -fno-omit-frame-pointer" ;;
+    *) echo "unknown mode '$MODE' (use: debug | release | asan | test | testasan)" >&2; exit 2 ;;
 esac
 
-if [[ "$MODE" == test ]]; then
+if [[ "$MODE" == test || "$MODE" == testasan ]]; then
     # Each tests/*.c is a standalone program that may #include app sources.
     for t in "$ROOT"/tests/*.c; do
         exe="$BUILD/test_$(basename "$t" .c)"

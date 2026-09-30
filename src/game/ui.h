@@ -187,10 +187,17 @@ void ui_icon_volume(Ui *ui, vec2 c, f32 s, f32 level, vec4 col);
 void ui_icon_plus(Ui *ui, vec2 c, f32 s, vec4 col);
 void ui_icon_queue_next(Ui *ui, vec2 c, f32 s, vec4 col);
 void ui_icon_minus(Ui *ui, vec2 c, f32 s, vec4 col);
+void ui_icon_download(Ui *ui, vec2 c, f32 s, vec4 col);
+/* Check mark drawn up to `t` (0..1) so it can animate in. */
+void ui_icon_check(Ui *ui, vec2 c, f32 s, f32 t, vec4 col);
+void ui_icon_retry(Ui *ui, vec2 c, f32 s, vec4 col);
+void ui_icon_chevron_up(Ui *ui, vec2 c, f32 s, vec4 col);
+void ui_icon_chevron_down(Ui *ui, vec2 c, f32 s, vec4 col);
+void ui_icon_warning(Ui *ui, vec2 c, f32 s, vec4 col);
 /* Animated equalizer bars (now-playing marker); `levels` 0..1 x4. */
 void ui_icon_eq(Ui *ui, vec2 c, f32 s, const f32 *levels, vec4 col);
 
-/* Keycap (e.g. "Ctrl", "K", "Enter"): rounded box with mono label. Returns width. */
-f32 ui_keycap(Ui *ui, Core_String label, f32 x, f32 cy, f32 h, Ui_Align align);
+/* Keycap (e.g. "Ctrl", "K", "Enter"): rounded box with mono label, faded by `alpha`. Returns width. */
+f32 ui_keycap(Ui *ui, Core_String label, f32 x, f32 cy, f32 h, Ui_Align align, f32 alpha);
 
 #endif /* GAME_UI_H */

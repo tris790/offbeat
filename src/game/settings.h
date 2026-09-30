@@ -34,6 +34,8 @@ typedef struct {
     u32  theme;           /* index into SETTINGS_THEMES */
     u32  vis;             /* Vis_Mode */
     b32  debug;           /* on-screen debug overlay */
+    char download_dir[1024]; /* where downloaded songs go; empty = "Downloads" inside the music folder */
+    u32  download_parallel;  /* songs downloaded at once, 1..3 */
 } Settings;
 
 void settings_default(Settings *s);

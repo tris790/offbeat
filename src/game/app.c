@@ -16,6 +16,8 @@
 #include "app.h"
 
 #include "covers.h"
+#include "download.h"
+#include "download_view.h"
 #include "library.h"
 #include "player.h"
 #include "search.h"
@@ -38,6 +40,8 @@
 enum { TAB_QUEUE = 0, TAB_GENRES, TAB_ARTISTS, TAB_SONGS, TAB_COUNT };
 enum { REPEAT_OFF = 0, REPEAT_ALL, REPEAT_ONE };
 enum { MENU_NONE = 0, MENU_TRACK, MENU_ARTIST, MENU_GENRE };
+enum { BROWSE_MUSIC = 0, BROWSE_DOWNLOADS };
+enum { PAL_ACT_SONG = 0, PAL_ACT_ARTIST, PAL_ACT_OPEN }; /* command-palette rows after the song hits */
 
 typedef struct {
     f32 target;   /* where the wheel wants the list          */
@@ -61,6 +65,11 @@ struct App {
     const char *config_dir;
     char index_path[1024];
     char state_path[1024];
+
+    /* song downloads (see download.h / download_view.h) */
+    Downloads *downloads;
+    Dl_View   *dlv;
+    char       download_dest[1100]; /* effective folder: setting, else <music>/Downloads */
 
     Library     *lib;
     Library     *lib_retired;  /* kept alive until the scanner is done with it */
@@ -149,6 +158,7 @@ struct App {
 
     /* folder browser page of the settings modal */
     b32          browse_open;
+    u32          browse_target;     /* BROWSE_MUSIC / BROWSE_DOWNLOADS: which folder it picks */
     char         browse_path[1024];
     Core_Arena   browse_arena; /* listing of browse_path, rebuilt on navigation */
     const char **browse_names;
@@ -168,6 +178,16 @@ struct App {
     u32         demo_frame;
     char        demo_type[64]; /* text being typed into the palette */
     u32         demo_typed;
+
+    /* scripted pointer / keyboard (headless runs have no real ones): tokens
+       mouse=X:Y  click  clickat=X:Y  key=NAME  text=STR, applied next frame */
+    b32         demo_mouse;
+    vec2        demo_mouse_pos, demo_mouse_prev;
+    u32         demo_click;            /* 3 press, 2 hold, 1 release, 0 idle */
+    u8          demo_keys[PLATFORM_KEY_COUNT];
+    b32         demo_keys_pending;
+    char        demo_text[48];
+    Platform_Input demo_in;
 };
 
 /* ------------------------------------------------------------------------- */
@@ -635,11 +655,22 @@ static void rescan_library(App *app) {
 
 /* Switch the library root. The rescan reuses unchanged tracks and drops the
    ones outside the new folder; the queue is remapped when it lands. */
+/* Downloaded songs are filed into the library (the artist's folder, see
+   download.h). Artists the library doesn't have yet go to the chosen folder,
+   by default "Downloads" inside the music folder (their own group). */
+static void apply_download_settings(App *app) {
+    if (app->settings.download_dir[0]) snprintf(app->download_dest, sizeof(app->download_dest), "%s", app->settings.download_dir);
+    else snprintf(app->download_dest, sizeof(app->download_dest), "%s/Downloads", app->music_dir);
+    downloads_configure(app->downloads, app->download_dest, app->settings.download_parallel);
+    downloads_set_library(app->downloads, app->music_dir);
+}
+
 static void set_music_dir(App *app, const char *dir) {
     if (strcmp(dir, app->music_dir) == 0) return;
     snprintf(app->settings.music_dir, sizeof(app->settings.music_dir), "%s", dir);
     app->music_dir = app->settings.music_dir;
     save_settings(app);
+    apply_download_settings(app);
     rescan_library(app);
 }
 
@@ -773,6 +804,14 @@ App *app_create(Core_Arena *arena, Core_Renderer *r, Platform_Window *win) {
     core_arena_init(&app->browse_arena, CORE_MB(64));
 
     /* ---- subsystems ---- */
+    {
+        char dl_state[1100], dl_work[1100];
+        snprintf(dl_state, sizeof(dl_state), "%s/downloads", app->config_dir);
+        snprintf(dl_work, sizeof(dl_work), "%s/downloads", app->cache_dir);
+        app->downloads = downloads_create(dl_state, dl_work);
+        app->dlv = dlv_create(app->downloads, r, app->cache_dir);
+        apply_download_settings(app);
+    }
     app->player = player_create();
     app->covers = covers_create(r, app->cache_dir, CORE_CLAMP(platform_cpu_count() / 4, 2u, 3u));
 
@@ -792,6 +831,8 @@ App *app_create(Core_Arena *arena, Core_Renderer *r, Platform_Window *win) {
 
 void app_shutdown(App *app) {
     save_state(app);
+    dlv_destroy(app->dlv);
+    downloads_destroy(app->downloads); /* running downloads stop and resume next time */
     if (app->scanner) library_scanner_destroy(app->scanner);
     player_destroy(app->player);
     covers_destroy(app->covers);
@@ -1970,6 +2011,24 @@ static void draw_hit_meta(App *app, const Lib_Track *t, const Search_Hit *h,
     draw_marked(app, t->album, h->mask[SEARCH_ALBUM], ax, y, px, UI_TEXT_DIM, alpha, max_w - (ax - x));
 }
 
+/* Rows after the song hits: the way into the download page. With a query
+   they search YouTube for it; on their own they just open the page. */
+static u32 palette_actions(App *app, u8 acts[2]) {
+    if (app->query_len == 0) { acts[0] = PAL_ACT_OPEN; return 1; }
+    acts[0] = PAL_ACT_SONG;
+    acts[1] = PAL_ACT_ARTIST;
+    return 2;
+}
+
+static void palette_run_action(App *app, u32 act) {
+    char q[sizeof(app->query) + 1];
+    memcpy(q, app->query, app->query_len);
+    q[app->query_len] = 0;
+    open_search(app, false);
+    if (act == PAL_ACT_OPEN) dlv_start_empty(app->dlv, DL_QUERY_SONG);
+    else dlv_search(app->dlv, act == PAL_ACT_ARTIST ? DL_QUERY_ARTIST : DL_QUERY_SONG, q, false);
+}
+
 /* the palette is 20% wider than its original 545 design width; heights are unchanged */
 #define PALETTE_W 654 /* 545 * 1.2 */
 #define PALETTE_IW (PALETTE_W - 54) /* content width inside the 29px side padding */
@@ -2003,15 +2062,22 @@ static void draw_palette(App *app, vec2 win) {
             }
         }
         run_search(app);
+        u8 pacts[2];
+        u32 nacts = palette_actions(app, pacts);
+        s32 total = (s32)(app->hit_count + nacts);
         if (in->key_pressed[PLATFORM_KEY_DOWN] || (in->key_pressed[PLATFORM_KEY_TAB] && !in->shift) ||
             (in->ctrl && in->key_pressed[PLATFORM_KEY_N]))
-            app->hit_sel = app->hit_count ? (app->hit_sel + 1) % (s32)app->hit_count : 0;
+            app->hit_sel = (app->hit_sel + 1) % total;
         if (in->key_pressed[PLATFORM_KEY_UP] || (in->key_pressed[PLATFORM_KEY_TAB] && in->shift) ||
             (in->ctrl && in->key_pressed[PLATFORM_KEY_P]))
-            app->hit_sel = app->hit_count ? (app->hit_sel + (s32)app->hit_count - 1) % (s32)app->hit_count : 0;
-        if (in->key_pressed[PLATFORM_KEY_ENTER] && app->hit_count) {
-            search_play(app, app->hits[app->hit_sel].track, in->shift);
-            open_search(app, false);
+            app->hit_sel = (app->hit_sel + total - 1) % total;
+        if (in->key_pressed[PLATFORM_KEY_ENTER]) {
+            if (app->hit_sel < (s32)app->hit_count) {
+                search_play(app, app->hits[app->hit_sel].track, in->shift);
+                open_search(app, false);
+            } else {
+                palette_run_action(app, pacts[app->hit_sel - (s32)app->hit_count]);
+            }
         }
         if (in->key_pressed[PLATFORM_KEY_ESCAPE]) {
             if (app->query_len) { app->query_len = 0; run_search(app); }
@@ -2019,9 +2085,12 @@ static void draw_palette(App *app, vec2 win) {
         }
     }
 
+    u8 pacts[2];
+    u32 nacts = palette_actions(app, pacts);
+    u32 total_rows = app->hit_count + nacts;
     f32 pw = S(PALETTE_W);
-    u32 shown_rows = CORE_MIN(app->hit_count, 4u);
-    f32 rows_h = app->hit_count ? S(67) * (f32)CORE_MAX(shown_rows, 1u) : S(64);
+    u32 shown_rows = CORE_MIN(total_rows, 4u);
+    f32 rows_h = S(67) * (f32)CORE_MAX(shown_rows, 1u);
     f32 target_h = S(101) + rows_h + S(78) - S(10);
     f32 ph = ui_spring(ui, ui_id("pal.h"), target_h, 500, 40);
     f32 sc = 0.94f + 0.06f * open;
@@ -2069,8 +2138,8 @@ static void draw_palette(App *app, vec2 win) {
     if (app->search_open) ui->animating = true; /* caret */
     /* Ctrl K keycaps */
     f32 kx = ip.x + is.x - S(21) * s;
-    kx -= ui_keycap(ui, core_str_lit("K"), kx, qy, S(26) * s, UI_ALIGN_RIGHT) + S(8) * s;
-    ui_keycap(ui, core_str_lit("Ctrl"), kx, qy, S(26) * s, UI_ALIGN_RIGHT);
+    kx -= ui_keycap(ui, core_str_lit("K"), kx, qy, S(26) * s, UI_ALIGN_RIGHT, vis) + S(8) * s;
+    ui_keycap(ui, core_str_lit("Ctrl"), kx, qy, S(26) * s, UI_ALIGN_RIGHT, vis);
 
     /* results */
     f32 ry0 = PY(101);
@@ -2082,36 +2151,72 @@ static void draw_palette(App *app, vec2 win) {
         if (sel_top < app->hit_scroll) app->hit_scroll = sel_top;
         if (sel_top > app->hit_scroll + 3) app->hit_scroll = sel_top - 3;
     }
-    if (ui_mouse_in(ui, vec2_make(p.x, ry0), vec2_make(w2, rows_h * s)) && in->scroll_y != 0 && app->hit_count > 4) {
-        app->hit_scroll = CORE_CLAMP(app->hit_scroll - in->scroll_y, 0.0f, (f32)(app->hit_count - 4));
+    if (ui_mouse_in(ui, vec2_make(p.x, ry0), vec2_make(w2, rows_h * s)) && in->scroll_y != 0 && total_rows > 4) {
+        app->hit_scroll = CORE_CLAMP(app->hit_scroll - in->scroll_y, 0.0f, (f32)(total_rows - 4));
     }
     f32 scroll = ui_ease(ui, ui_id("pal.scroll"), app->hit_scroll, 18.0f);
     core_clip_push(r, vec2_make(p.x, ry0 - S(2)), vec2_make(w2, rows_h * s + S(2)));
     f32 sel_y = ui_spring(ui, ui_id("pal.sel"), ry0 + ((f32)app->hit_sel - scroll) * row_h, 600, 42);
-    if (app->hit_count) {
+    if (total_rows) {
         Core_BoxStyle sb = { .radius = S(9), .fill = UI_RGBA(255, 255, 255, 0.055f * vis),
                              .border = S(1), .border_color = UI_RGBA(255, 255, 255, 0.07f * vis) };
         core_draw_box(r, vec2_make(PX(29), sel_y), vec2_make(S(PALETTE_IW) * s, S(63) * s), &sb);
     }
     s32 first = (s32)floorf(scroll);
-    for (s32 i = first; i < (s32)app->hit_count && i < first + 6; i++) {
+    for (s32 i = first; i < (s32)total_rows && i < first + 6; i++) {
         if (i < 0) continue;
-        const Lib_Track *t = track_at(app, app->hits[i].track);
-        if (!t) continue;
         f32 y = ry0 + ((f32)i - scroll) * row_h;
         f32 st = clamp01(appear * 3.0f - (f32)(i - first) * 0.35f);
         f32 e = ease_out_cubic(st);
         vec2 rp = vec2_make(PX(29), y), rs = vec2_make(S(PALETTE_IW) * s, S(63) * s);
-        u64 id = ui_idx(ui_id("pal.row"), t->path_hash);
-        Ui_Interact it = ui_interact(ui, id, rp, rs, PLATFORM_CURSOR_HAND);
-        if (it.hovered && (in->mouse_delta.x != 0 || in->mouse_delta.y != 0)) app->hit_sel = i;
-        if (it.clicked) { search_play(app, app->hits[i].track, in->shift); open_search(app, false); }
-        if (it.right_clicked) { app->hit_sel = i; open_menu(app, app->hits[i].track, -1, true); }
         f32 ox = S(14) * (1 - e);
-        draw_thumb(app, t, vec2_make(rp.x + S(16) * s + ox, y + (rs.y - S(50) * s) * 0.5f), S(50) * s, S(6), e * vis);
-        f32 tx = rp.x + S(93) * s + ox;
-        draw_marked(app, t->title, app->hits[i].mask[SEARCH_TITLE], tx, y + S(21) * s, S(16) * s, UI_TEXT, e * vis, S(330 + PALETTE_W - 545));
-        draw_hit_meta(app, t, &app->hits[i], tx, y + S(45) * s, S(14) * s, e * vis, S(330 + PALETTE_W - 545));
+        if (i < (s32)app->hit_count) {
+            const Lib_Track *t = track_at(app, app->hits[i].track);
+            if (!t) continue;
+            u64 id = ui_idx(ui_id("pal.row"), t->path_hash);
+            Ui_Interact it = ui_interact(ui, id, rp, rs, PLATFORM_CURSOR_HAND);
+            if (it.hovered && (in->mouse_delta.x != 0 || in->mouse_delta.y != 0)) app->hit_sel = i;
+            if (it.clicked) { search_play(app, app->hits[i].track, in->shift); open_search(app, false); }
+            if (it.right_clicked) { app->hit_sel = i; open_menu(app, app->hits[i].track, -1, true); }
+            draw_thumb(app, t, vec2_make(rp.x + S(16) * s + ox, y + (rs.y - S(50) * s) * 0.5f), S(50) * s, S(6), e * vis);
+            f32 tx = rp.x + S(93) * s + ox;
+            draw_marked(app, t->title, app->hits[i].mask[SEARCH_TITLE], tx, y + S(21) * s, S(16) * s, UI_TEXT, e * vis, S(330 + PALETTE_W - 545));
+            draw_hit_meta(app, t, &app->hits[i], tx, y + S(45) * s, S(14) * s, e * vis, S(330 + PALETTE_W - 545));
+        } else {
+            /* "get music" row: an accent tile instead of cover art */
+            u32 act = pacts[i - (s32)app->hit_count];
+            Ui_Interact it = ui_interact(ui, ui_idx(ui_id("pal.act"), act), rp, rs, PLATFORM_CURSOR_HAND);
+            if (it.hovered && (in->mouse_delta.x != 0 || in->mouse_delta.y != 0)) app->hit_sel = i;
+            if (it.clicked) palette_run_action(app, act);
+            vec2 tp = vec2_make(rp.x + S(16) * s + ox, y + (rs.y - S(50) * s) * 0.5f);
+            f32 hv = CORE_MAX(it.hover_t, i == app->hit_sel ? 0.5f : 0.0f);
+            Core_BoxStyle tile = { .radius = S(9) * s, .fill = UI_RGBA(150, 118, 255, (0.85f + 0.1f * hv) * e * vis),
+                                   .fill2 = UI_RGBA(96, 62, 214, (0.85f + 0.1f * hv) * e * vis), .gradient = 1 };
+            core_draw_box(r, tp, vec2_make(S(50) * s, S(50) * s), &tile);
+            vec2 tc = vec2_make(tp.x + S(25) * s, tp.y + S(25) * s);
+            if (act == PAL_ACT_ARTIST) ui_icon_person(ui, tc, S(24) * s, ui_alpha(UI_TEXT, e * vis));
+            else ui_icon_download(ui, tc, S(24) * s, ui_alpha(UI_TEXT, e * vis));
+            f32 tx = rp.x + S(93) * s + ox;
+            f32 mw = S(330 + PALETTE_W - 545);
+            char title[320], sub[160];
+            if (act == PAL_ACT_OPEN) {
+                snprintf(title, sizeof(title), "Download music");
+                snprintf(sub, sizeof(sub), "Find songs and artists on YouTube");
+            } else {
+                char q[sizeof(app->query) + 1];
+                memcpy(q, app->query, app->query_len);
+                q[app->query_len] = 0;
+                if (act == PAL_ACT_SONG) {
+                    snprintf(title, sizeof(title), "Download \xE2\x80\x9C%s\xE2\x80\x9D", q);
+                    snprintf(sub, sizeof(sub), app->hit_count ? "Search YouTube and pick a version" : "No match in your library, search YouTube");
+                } else {
+                    snprintf(title, sizeof(title), "Top songs by \xE2\x80\x9C%s\xE2\x80\x9D", q);
+                    snprintf(sub, sizeof(sub), "Pick from the artist's 100 most popular");
+                }
+            }
+            ui_text(ui, ui->font, core_str(title), tx, y + S(21) * s, S(16) * s, ui_alpha(UI_TEXT, e * vis), UI_ALIGN_LEFT, mw);
+            ui_text(ui, ui->font, core_str(sub), tx, y + S(45) * s, S(14) * s, ui_alpha(UI_LAVENDER, e * vis * 0.9f), UI_ALIGN_LEFT, mw);
+        }
         if (i == app->hit_sel) {
             vec2 kc = vec2_make(rp.x + rs.x - S(36) * s, y + rs.y * 0.5f);
             Core_BoxStyle kb = { .radius = S(7), .fill = UI_RGBA(139, 102, 255, 0.22f * vis),
@@ -2119,11 +2224,6 @@ static void draw_palette(App *app, vec2 win) {
             core_draw_box(r, vec2_make(kc.x - S(18) * s, kc.y - S(18) * s), vec2_make(S(36) * s, S(36) * s), &kb);
             ui_icon_enter(ui, kc, S(18) * s, ui_alpha(UI_ACCENT_BRIGHT, vis));
         }
-    }
-    if (!app->hit_count) {
-        Core_String msg = app->query_len ? core_str_lit("No matches") :
-            str_fmt(app, "Type to search %u songs", app->lib ? app->lib->track_count : 0);
-        ui_text(ui, ui->font, msg, p.x + w2 * 0.5f, ry0 + S(30) * s, S(15) * s, ui_alpha(UI_TEXT_DIM, vis), UI_ALIGN_CENTER, 0);
     }
     core_clip_pop(r);
 
@@ -2136,12 +2236,12 @@ static void draw_palette(App *app, vec2 win) {
     x -= ui_text_width(ui, ui->font, t2, S(14) * s);
     ui_text(ui, ui->font, t2, x, cy, S(14) * s, ui_alpha(UI_TEXT_DIM, vis), UI_ALIGN_LEFT, 0);
     x -= S(11) * s;
-    x -= ui_keycap(ui, core_str_lit("Esc"), x, cy, S(24) * s, UI_ALIGN_RIGHT) + S(26) * s;
-    Core_String t1 = core_str_lit("to play");
+    x -= ui_keycap(ui, core_str_lit("Esc"), x, cy, S(24) * s, UI_ALIGN_RIGHT, vis) + S(26) * s;
+    Core_String t1 = app->hit_sel >= (s32)app->hit_count ? core_str_lit("to search") : core_str_lit("to play");
     x -= ui_text_width(ui, ui->font, t1, S(14) * s);
     ui_text(ui, ui->font, t1, x, cy, S(14) * s, ui_alpha(UI_TEXT_DIM, vis), UI_ALIGN_LEFT, 0);
     x -= S(11) * s;
-    ui_keycap(ui, core_str_lit("Enter"), x, cy, S(24) * s, UI_ALIGN_RIGHT);
+    ui_keycap(ui, core_str_lit("Enter"), x, cy, S(24) * s, UI_ALIGN_RIGHT, vis);
     #undef PX
     #undef PY
 
@@ -2155,7 +2255,32 @@ static void draw_palette(App *app, vec2 win) {
 /* context menu                                                              */
 /* ------------------------------------------------------------------------- */
 
-enum { ACT_NEXT, ACT_QUEUE, ACT_REMOVE, ACT_ARTIST_NEXT, ACT_ARTIST_QUEUE, ACT_GENRE_NEXT, ACT_GENRE_QUEUE };
+enum { ACT_NEXT, ACT_QUEUE, ACT_REMOVE, ACT_ARTIST_NEXT, ACT_ARTIST_QUEUE, ACT_GENRE_NEXT, ACT_GENRE_QUEUE, ACT_DL_ARTIST };
+
+/* The artist a menu is about (track menus: the track's artist), or 0 when
+   there is no real one to look up ("Unknown Artist"). */
+static const Lib_Artist *menu_artist_of(App *app) {
+    if (!app->lib) return 0;
+    u32 ai = UINT32_MAX;
+    if (app->menu == MENU_ARTIST) ai = app->menu_artist;
+    else if (app->menu == MENU_TRACK) {
+        const Lib_Track *t = track_at(app, app->menu_track);
+        if (t) ai = t->artist_index;
+    }
+    if (ai >= app->lib->artist_count) return 0;
+    const Lib_Artist *a = &app->lib->artists[ai];
+    if (!a->name.len || core_str_eq(a->name, core_str_lit("Unknown Artist"))) return 0;
+    return a;
+}
+
+/* Open the download page on an artist's top songs, all ticked. */
+static void download_artist(App *app, Core_String name) {
+    char q[256];
+    copy_str(q, sizeof(q), name);
+    open_search(app, false);
+    app->menu = MENU_NONE;
+    dlv_search(app->dlv, DL_QUERY_ARTIST, q, true);
+}
 
 static void draw_menu(App *app, vec2 win) {
     Ui *ui = &app->ui;
@@ -2166,14 +2291,16 @@ static void draw_menu(App *app, vec2 win) {
         [ACT_NEXT] = "Play next", [ACT_QUEUE] = "Add to queue", [ACT_REMOVE] = "Remove from queue",
         [ACT_ARTIST_NEXT] = "Play artist next", [ACT_ARTIST_QUEUE] = "Queue all from artist",
         [ACT_GENRE_NEXT] = "Play genre next", [ACT_GENRE_QUEUE] = "Queue all from genre",
+        [ACT_DL_ARTIST] = "Download top 100 by artist",
     };
-    u8 acts[4];
+    u8 acts[8];
     u32 n = 0;
     acts[n++] = app->menu == MENU_ARTIST ? ACT_ARTIST_NEXT : app->menu == MENU_GENRE ? ACT_GENRE_NEXT : ACT_NEXT;
     acts[n++] = app->menu == MENU_ARTIST ? ACT_ARTIST_QUEUE : app->menu == MENU_GENRE ? ACT_GENRE_QUEUE : ACT_QUEUE;
     if (app->menu == MENU_TRACK && app->menu_queue_index >= 0) acts[n++] = ACT_REMOVE;
     if (app->menu == MENU_TRACK && app->menu_artist_actions) { acts[n++] = ACT_ARTIST_QUEUE; acts[n++] = ACT_ARTIST_NEXT; }
-    f32 w = S(214), ih = S(38);
+    if (menu_artist_of(app)) acts[n++] = ACT_DL_ARTIST;
+    f32 w = S(252), ih = S(38);
     f32 h = ih * (f32)n + S(12);
     vec2 p = app->menu_pos;
     if (p.x + w > win.x - S(8)) p.x = win.x - S(8) - w;
@@ -2196,11 +2323,17 @@ static void draw_menu(App *app, vec2 win) {
         vec4 col = ui_alpha(ui_mix(UI_RGBA(215, 210, 235, 1), UI_TEXT, it.hover_t), clamp01(t));
         if (act == ACT_NEXT || act == ACT_ARTIST_NEXT || act == ACT_GENRE_NEXT) ui_icon_queue_next(ui, ic, S(16), col);
         else if (act == ACT_QUEUE || act == ACT_ARTIST_QUEUE || act == ACT_GENRE_QUEUE) ui_icon_plus(ui, ic, S(16), col);
+        else if (act == ACT_DL_ARTIST) ui_icon_download(ui, ic, S(17), col);
         else ui_icon_minus(ui, ic, S(16), col);
         ui_text(ui, ui->font, core_str(labels[act]), ip.x + S(38), ic.y, S(14), col, UI_ALIGN_LEFT, 0);
         if (it.clicked) {
             const Lib_Artist *a = 0;
             const Lib_Genre *g = 0;
+            if (act == ACT_DL_ARTIST) {
+                const Lib_Artist *da = menu_artist_of(app);
+                if (da) download_artist(app, da->name);
+                continue;
+            }
             if (app->lib && act >= ACT_GENRE_NEXT) {
                 if (app->menu_genre < app->lib->genre_count) g = &app->lib->genres[app->menu_genre];
             } else if (app->lib && act >= ACT_ARTIST_NEXT) {
@@ -2263,11 +2396,14 @@ static void browse_up(App *app) {
     browse_to(app, parent);
 }
 
-static void open_browse(App *app, b32 open) {
+static void open_browse(App *app, b32 open, u32 target) {
     app->browse_open = open;
+    app->browse_target = target;
     if (open) {
-        /* start where the library is; fall back to home if it's gone */
-        const char *start = platform_file_info(app->music_dir).is_dir ? app->music_dir : platform_home_dir(&app->frame);
+        /* start where the folder is now; fall back to the library, then home, if it's gone */
+        const char *now = target == BROWSE_DOWNLOADS ? app->download_dest : app->music_dir;
+        const char *start = platform_file_info(now).is_dir ? now
+                          : platform_file_info(app->music_dir).is_dir ? app->music_dir : platform_home_dir(&app->frame);
         browse_to(app, start);
     }
 }
@@ -2450,7 +2586,7 @@ static void draw_settings_main(App *app, vec2 p, f32 w, f32 vis) {
     ui_text(ui, ui->font_med, core_str_lit("Music folder"), lx, ry - S(10), S(15.5f), ui_alpha(UI_TEXT, vis), UI_ALIGN_LEFT, lw);
     draw_path(app, core_str(app->music_dir), lx, ry + S(11), S(13), ui_alpha(UI_TEXT_DIM, vis), lw);
     if (settings_button(app, "set.change", change, vec2_make(xr - bw1, ry - bh * 0.5f), vec2_make(bw1, bh), true, vis).clicked)
-        open_browse(app, true);
+        open_browse(app, true, BROWSE_MUSIC);
     if (settings_button(app, "set.rescan", rescan, vec2_make(xr - bw1 - S(10) - bw2, ry - bh * 0.5f), vec2_make(bw2, bh), false, vis).clicked)
         rescan_library(app);
     Core_String status = app->scanner
@@ -2475,13 +2611,42 @@ static void draw_settings_main(App *app, vec2 p, f32 w, f32 vis) {
     if (v != app->settings.vis) { app->settings.vis = v; save_settings(app); }
     y += S(76);
 
+    /* ---- downloads ---- */
+    y = settings_section(app, "DOWNLOADS", x, y, cw, vis);
+    {
+        Core_String dchange = core_str_lit("Change"), dreset = core_str_lit("Default");
+        b32 custom = app->settings.download_dir[0] != 0;
+        f32 cb1 = settings_button_w(app, dchange), cb2 = custom ? settings_button_w(app, dreset) : 0;
+        f32 dry = y + S(16);
+        ui_icon_download(ui, vec2_make(x + S(14), dry), S(24), ui_alpha(UI_LAVENDER, vis));
+        f32 dlx = x + S(40), dlw = cw - S(40) - cb1 - cb2 - (custom ? S(26) : S(16));
+        ui_text(ui, ui->font_med, core_str_lit("Folder for new artists"), dlx, dry - S(10), S(15.5f), ui_alpha(UI_TEXT, vis), UI_ALIGN_LEFT, dlw);
+        draw_path(app, core_str(app->download_dest), dlx, dry + S(11), S(13), ui_alpha(UI_TEXT_DIM, vis), dlw);
+        if (settings_button(app, "set.dlchange", dchange, vec2_make(xr - cb1, dry - bh * 0.5f), vec2_make(cb1, bh), true, vis).clicked)
+            open_browse(app, true, BROWSE_DOWNLOADS);
+        if (custom && settings_button(app, "set.dlreset", dreset, vec2_make(xr - cb1 - S(10) - cb2, dry - bh * 0.5f), vec2_make(cb2, bh), false, vis).clicked) {
+            app->settings.download_dir[0] = 0;
+            save_settings(app);
+            apply_download_settings(app);
+        }
+        y = dry + S(46);
+        f32 pseg_w = S(52);
+        static const char *const pl[3] = { "1", "2", "3" };
+        f32 pseg_x = xr - pseg_w * 3 - S(6);
+        settings_label(app, "Downloads at once", core_str_lit("More is faster, but YouTube may slow you down"), x, y + S(20), pseg_x - x - S(12), vis);
+        u32 par = settings_segmented(app, "set.par", pl, 3, CORE_CLAMP(app->settings.download_parallel, 1u, 3u) - 1,
+                                     vec2_make(pseg_x, y), pseg_w, vis) + 1;
+        if (par != app->settings.download_parallel) { app->settings.download_parallel = par; save_settings(app); apply_download_settings(app); }
+        y += S(76);
+    }
+
     /* ---- developer ---- */
     y = settings_section(app, "DEVELOPER", x, y, cw, vis);
     f32 dy = y + S(16);
     settings_label(app, "Debug overlay", core_str_lit("Frame time, memory and draw stats"), x, dy, cw - S(140), vis);
     b32 dbg = settings_toggle(app, "set.debug", vec2_make(xr - S(44), dy - S(13)), app->settings.debug, vis);
     if (dbg != app->settings.debug) { app->settings.debug = dbg; save_settings(app); }
-    ui_keycap(ui, core_str_lit("F1"), xr - S(58), dy, S(24), UI_ALIGN_RIGHT);
+    ui_keycap(ui, core_str_lit("F1"), xr - S(58), dy, S(24), UI_ALIGN_RIGHT, 1);
 }
 
 static void draw_settings_browse(App *app, vec2 p, f32 w, f32 h, f32 vis) {
@@ -2552,7 +2717,13 @@ static void draw_settings_browse(App *app, vec2 p, f32 w, f32 h, f32 vis) {
     if (ui->input_enabled && in->key_pressed[PLATFORM_KEY_BACKSPACE]) browse_up(app);
     if (ui->input_enabled && in->key_pressed[PLATFORM_KEY_ENTER]) chosen = true;
     if (chosen) {
-        set_music_dir(app, app->browse_path);
+        if (app->browse_target == BROWSE_DOWNLOADS) {
+            snprintf(app->settings.download_dir, sizeof(app->settings.download_dir), "%s", app->browse_path);
+            save_settings(app);
+            apply_download_settings(app);
+        } else {
+            set_music_dir(app, app->browse_path);
+        }
         back = true;
     }
     if (back) app->browse_open = false;
@@ -2572,7 +2743,7 @@ static void draw_settings(App *app, vec2 win) {
     /* page switch: the card resizes and the pages crossfade with a slide */
     f32 page = ui_spring(ui, ui_id("set.page"), app->browse_open ? 1.0f : 0.0f, 380, 32);
     f32 w = S(600);
-    f32 h = ui_spring(ui, ui_id("set.h"), app->browse_open ? CORE_MIN(S(640), win.y - S(60)) : S(540), 480, 40);
+    f32 h = ui_spring(ui, ui_id("set.h"), app->browse_open ? CORE_MIN(S(640), win.y - S(60)) : CORE_MIN(S(690), win.y - S(40)), 480, 40);
     f32 sc = 0.94f + 0.06f * open;
     f32 w2 = w * sc, h2 = h * sc;
     vec2 p = vec2_make(roundf(win.x * 0.5f - w2 * 0.5f), roundf(win.y * 0.5f - h2 * 0.5f + S(14) * (1 - open)));
@@ -2597,7 +2768,7 @@ static void draw_settings(App *app, vec2 win) {
     ui_icon_gear(ui, vec2_make(p.x + S(46) - S(30) * pg, hy), S(24), ui_alpha(UI_LAVENDER, vis * (1 - pg)));
     ui_text(ui, ui->font_semi, core_str_lit("Settings"), p.x + S(70) - S(30) * pg, hy, S(22),
             ui_alpha(UI_TEXT, vis * (1 - pg)), UI_ALIGN_LEFT, 0);
-    ui_text(ui, ui->font_semi, core_str_lit("Choose music folder"), p.x + S(32) + S(30) * (1 - pg), hy, S(22),
+    ui_text(ui, ui->font_semi, app->browse_target == BROWSE_DOWNLOADS ? core_str_lit("Choose folder for new artists") : core_str_lit("Choose music folder"), p.x + S(32) + S(30) * (1 - pg), hy, S(22),
             ui_alpha(UI_TEXT, vis * pg), UI_ALIGN_LEFT, 0);
     vec2 xc = vec2_make(p.x + w2 - S(40), hy);
     Ui_Interact close = ui_interact(ui, ui_id("set.close"), vec2_make(xc.x - S(17), xc.y - S(17)), vec2_make(S(34), S(34)),
@@ -2663,8 +2834,46 @@ static void draw_debug(App *app, f32 dt) {
 /* demo script (headless screenshots / smoke tests)                          */
 /* ------------------------------------------------------------------------- */
 
+static void demo_key(App *app, const char *name) {
+    static const struct { const char *name; Platform_Key key; } keys[] = {
+        { "enter", PLATFORM_KEY_ENTER }, { "tab", PLATFORM_KEY_TAB }, { "esc", PLATFORM_KEY_ESCAPE },
+        { "up", PLATFORM_KEY_UP }, { "down", PLATFORM_KEY_DOWN }, { "backspace", PLATFORM_KEY_BACKSPACE },
+        { "space", PLATFORM_KEY_SPACE },
+    };
+    for (u32 i = 0; i < CORE_ARRAY_COUNT(keys); i++)
+        if (strcmp(keys[i].name, name) == 0) { app->demo_keys[keys[i].key] = 1; app->demo_keys_pending = true; }
+}
+
 static void demo_token(App *app, char *tok) {
-    if (strncmp(tok, "search=", 7) == 0) {
+    if (strncmp(tok, "mouse=", 6) == 0) {                /* scripted pointer */
+        app->demo_mouse = true;
+        app->demo_mouse_pos = vec2_make((f32)atof(tok + 6), (f32)atof(strchr(tok + 6, ':') ? strchr(tok + 6, ':') + 1 : "0"));
+    } else if (strcmp(tok, "click") == 0 || strncmp(tok, "clickat=", 8) == 0) {
+        if (tok[5] == 'a') {
+            app->demo_mouse = true;
+            app->demo_mouse_pos = vec2_make((f32)atof(tok + 8), (f32)atof(strchr(tok + 8, ':') ? strchr(tok + 8, ':') + 1 : "0"));
+        }
+        app->demo_click = 3;
+    } else if (strncmp(tok, "key=", 4) == 0) {
+        demo_key(app, tok + 4);
+    } else if (strncmp(tok, "text=", 5) == 0) {
+        snprintf(app->demo_text, sizeof(app->demo_text), "%s", tok + 5);
+    } else if (strcmp(tok, "dl") == 0) {                 /* open the download page */
+        open_search(app, false);
+        dlv_start_empty(app->dlv, DL_QUERY_SONG);
+    } else if (strncmp(tok, "dlsong=", 7) == 0) {        /* ... and search a song */
+        dlv_search(app->dlv, DL_QUERY_SONG, tok + 7, false);
+    } else if (strncmp(tok, "dlartist=", 9) == 0) {      /* ... or an artist's top songs */
+        dlv_search(app->dlv, DL_QUERY_ARTIST, tok + 9, false);
+    } else if (strncmp(tok, "dlartistall=", 12) == 0) {  /* ... with everything ticked */
+        dlv_search(app->dlv, DL_QUERY_ARTIST, tok + 12, true);
+    } else if (strcmp(tok, "dlgo") == 0) {               /* download what is ticked / highlighted */
+        dlv_demo_download(app->dlv);
+    } else if (strcmp(tok, "dldock") == 0 || strcmp(tok, "dlundock") == 0) {
+        dlv_demo_dock(app->dlv, tok[2] == 'd');
+    } else if (strcmp(tok, "dlclose") == 0) {
+        dlv_open(app->dlv, false);
+    } else if (strncmp(tok, "search=", 7) == 0) {
         open_search(app, true);
         u32 n = (u32)strlen(tok + 7);
         memcpy(app->query, tok + 7, n);
@@ -2704,10 +2913,11 @@ static void demo_token(App *app, char *tok) {
         app->settings.debug = true;
     } else if (strcmp(tok, "settings") == 0) {
         open_settings(app, true);
-    } else if (strncmp(tok, "browse", 6) == 0) {
+    } else if (strncmp(tok, "browse", 6) == 0) { /* browse[=PATH] or browsedl[=PATH] (download folder) */
         open_settings(app, true);
-        open_browse(app, true);
-        if (tok[6] == '=') browse_to(app, tok + 7);
+        b32 dl = strncmp(tok, "browsedl", 8) == 0;
+        open_browse(app, true, dl ? BROWSE_DOWNLOADS : BROWSE_MUSIC);
+        if (tok[dl ? 8 : 6] == '=') browse_to(app, tok + (dl ? 9 : 7));
     } else if (strncmp(tok, "folder=", 7) == 0) {
         set_music_dir(app, tok + 7);
     } else if (strncmp(tok, "theme=", 6) == 0) {
@@ -2806,11 +3016,18 @@ static void run_demo(App *app) {
 static void handle_shortcuts(App *app, const Platform_Input *in) {
     if (in->ctrl && in->key_pressed[PLATFORM_KEY_K]) { open_settings(app, false); open_search(app, !app->search_open); return; }
     if (in->ctrl && in->key_pressed[PLATFORM_KEY_COMMA]) { open_search(app, false); open_settings(app, !app->settings_open); return; }
+    if (in->ctrl && in->key_pressed[PLATFORM_KEY_D] && !app->settings_open) {
+        open_search(app, false);
+        app->menu = MENU_NONE;
+        if (dlv_is_open(app->dlv)) dlv_open(app->dlv, false);
+        else dlv_start_empty(app->dlv, DL_QUERY_SONG);
+        return;
+    }
     if (in->key_pressed[PLATFORM_KEY_F1]) { app->settings.debug = !app->settings.debug; save_settings(app); }
     if (in->key_pressed[PLATFORM_KEY_MEDIA_PLAY_PAUSE]) toggle_pause(app);
     if (in->key_pressed[PLATFORM_KEY_MEDIA_NEXT]) skip(app, +1);
     if (in->key_pressed[PLATFORM_KEY_MEDIA_PREV]) skip(app, -1);
-    if (app->search_open || app->menu || app->settings_open) return;
+    if (app->search_open || app->menu || app->settings_open || dlv_is_open(app->dlv)) return;
 
     /* typing a letter opens search with it (fast path to find anything) */
     if (in->text_len && !in->ctrl && !in->alt && in->text[0] != ' ') {
@@ -2876,7 +3093,7 @@ static void handle_window_chrome(App *app, vec2 win, f32 left_w) {
     if (!in->mouse_pressed[PLATFORM_MOUSE_LEFT] || ui->mouse_taken || app->search_open || app->settings_open) return;
     /* drag strip: top of the window, and empty stage corners */
     b32 top = m.y < S(44);
-    b32 stage_empty = m.x < left_w && m.y < S(120);
+    b32 stage_empty = m.x < left_w && m.y < S(120) && !dlv_visible(app->dlv);
     if (top || stage_empty) {
         if (ui->double_click) platform_window_toggle_maximize(app->win);
         else platform_window_begin_move(app->win);
@@ -2888,6 +3105,33 @@ b32 app_frame(App *app, const Platform_Input *in, f32 dt, u32 width, u32 height)
     Core_Renderer *r = app->r;
     core_arena_reset(&app->frame);
     app->now += dt;
+
+    /* scripted input (OFFBEAT_DEMO mouse=/click/key=/text= tokens) replaces the real one */
+    if (app->demo_mouse || app->demo_click || app->demo_text[0] || app->demo_keys_pending) {
+        Platform_Input *di = &app->demo_in;
+        *di = *in;
+        if (app->demo_mouse) {
+            di->mouse_inside = true;
+            di->mouse_pos = app->demo_mouse_pos;
+            if (app->demo_mouse_pos.x != app->demo_mouse_prev.x || app->demo_mouse_pos.y != app->demo_mouse_prev.y)
+                di->mouse_delta = vec2_make(1, 1);
+            app->demo_mouse_prev = app->demo_mouse_pos;
+        }
+        if (app->demo_click == 3) { di->mouse_pressed[PLATFORM_MOUSE_LEFT] = true; di->mouse_down[PLATFORM_MOUSE_LEFT] = true; }
+        else if (app->demo_click == 2) di->mouse_down[PLATFORM_MOUSE_LEFT] = true;
+        else if (app->demo_click == 1) di->mouse_released[PLATFORM_MOUSE_LEFT] = true;
+        if (app->demo_click) app->demo_click--;
+        for (u32 k = 0; k < PLATFORM_KEY_COUNT; k++)
+            if (app->demo_keys[k]) { di->key_pressed[k] = true; di->key_down[k] = true; app->demo_keys[k] = 0; }
+        app->demo_keys_pending = false;
+        if (app->demo_text[0]) {
+            u32 n = (u32)strlen(app->demo_text);
+            memcpy(di->text, app->demo_text, n);
+            di->text_len = n;
+            app->demo_text[0] = 0;
+        }
+        in = di;
+    }
 
     vec2 win = vec2_make((f32)width, (f32)height);
     f32 scale = CORE_CLAMP(CORE_MIN(win.x / DESIGN_W, win.y / DESIGN_H), 0.62f, 1.6f);
@@ -2940,7 +3184,7 @@ b32 app_frame(App *app, const Platform_Input *in, f32 dt, u32 width, u32 height)
     f32 panel_w = roundf(CORE_CLAMP(win.x * 0.3256f, S(360), S(520)));
     f32 left_w = win.x - panel_w;
     f32 H = win.y;
-    b32 modal = app->search_open || app->menu != MENU_NONE || app->settings_open;
+    b32 modal = app->search_open || app->menu != MENU_NONE || app->settings_open || dlv_visible(app->dlv);
 
     core_renderer_begin_frame(r, (vec4){0});
     Scene_Colors sc = scene_colors(app);
@@ -2984,6 +3228,17 @@ b32 app_frame(App *app, const Platform_Input *in, f32 dt, u32 width, u32 height)
     draw_panel(app, left_w, panel_w, H, playing);
 
     handle_window_chrome(app, win, left_w);
+
+    /* downloads: a status pill on the player screen, and the page itself above it */
+    if (!modal && dlv_draw_status(app->dlv, ui, vec2_make(S(24), S(22)))) dlv_open(app->dlv, true);
+    {
+        Dlv_Frame df = { .lib = app->lib, .dest_dir = app->music_dir, .win = app->win,
+                         .blocked = app->search_open || app->settings_open || app->menu != MENU_NONE };
+        Dlv_Out dout = {0};
+        dlv_draw(app->dlv, ui, &df, &dout);
+        if (dout.open_settings) open_settings(app, true);
+    }
+    if (downloads_take_finished(app->downloads)) app->rescan_at = app->now + 2.0; /* new songs show up in the library */
 
     ui_draw_effects(ui);
     draw_palette(app, win);
