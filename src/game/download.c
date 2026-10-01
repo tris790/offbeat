@@ -250,16 +250,19 @@ static b32 variant_tags(const char *s, size_t len) {
         "remix", "mix", "edit", "edited", "cleaned", "dirty", "karaoke", "demo",
         "vip", "vocal", "radio", "extended", "remaster", "remastered",
     };
-    if (release_tags(s, len)) return true;
+    b32 any = false, all_release = true;
     for (size_t i = 0; i < len;) {
         while (i < len && !isalnum((u8)s[i])) i++;
         size_t st = i;
         while (i < len && isalnum((u8)s[i])) i++;
         size_t n = i - st;
+        if (!n) break;
+        any = true;
+        all_release = all_release && release_word(s + st, n);
         for (u32 j = 0; j < CORE_ARRAY_COUNT(markers); j++)
             if (strlen(markers[j]) == n && !strncasecmp(s + st, markers[j], n)) return true;
     }
-    return false;
+    return any && all_release;
 }
 
 /* Balanced brackets, including nested release labels. */
@@ -301,6 +304,21 @@ void dl_song_key(const char *title, char *out, u32 cap) {
     if (!cap) return;
     char t[DL_TEXT * 2];
     copy_to(t, sizeof(t), title);
+    /* Plain titles take one folding pass. Only spaces that could introduce
+       credits or bare suffixes, brackets, and spaced dashes need parsing. */
+    b32 annotated = false;
+    u32 plain = 0;
+    for (size_t i = 0; t[i]; i++) {
+        u8 c = (u8)t[i];
+        if (c == '(' || c == '[') annotated = true;
+        if (c == ' ') {
+            u8 next = (u8)tolower((u8)t[i + 1]);
+            if (next == 'f' || next == 'i' || next == 'a' || next == 'r' || next == '-') annotated = true;
+        }
+        if ((isalnum(c) || c >= 0x80) && plain + 1 < cap) out[plain++] = (char)tolower(c);
+    }
+    out[plain] = 0;
+    if (!annotated) return;
     /* " - Remastered 2011" / " - Single Version" / " feat. X" tails */
     char *dash = 0;
     for (char *p = t; (p = strstr(p, " - ")) != 0; p += 3) dash = p;
@@ -309,11 +327,17 @@ void dl_song_key(const char *title, char *out, u32 cap) {
     for (u32 i = 0; i < CORE_ARRAY_COUNT(feats); i++) {
         size_t fl = strlen(feats[i]);
         for (char *p = t; *p; p++)
-            if (strncasecmp(p, feats[i], fl) == 0) { *p = 0; break; }
+            if (*p == ' ' && strncasecmp(p, feats[i], fl) == 0) { *p = 0; break; }
     }
     static const char *const tails[] = { " instrumental", " acapella", " accapella", " a cappella", " radio edit" };
-    for (u32 i = 0; i < CORE_ARRAY_COUNT(tails); i++)
-        if (strlen(t) > strlen(tails[i]) && ci_suffix(t, tails[i])) t[strlen(t) - strlen(tails[i])] = 0;
+    size_t title_len = strlen(t);
+    for (u32 i = 0; i < CORE_ARRAY_COUNT(tails); i++) {
+        size_t len = strlen(tails[i]);
+        if (title_len > len && ci_prefix(t + title_len - len, tails[i])) {
+            title_len -= len;
+            t[title_len] = 0;
+        }
+    }
     u32 w = 0;
     for (size_t i = 0; t[i] && w + 1 < cap; i++) {
         u8 c = (u8)t[i];
