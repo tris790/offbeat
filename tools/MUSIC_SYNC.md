@@ -46,6 +46,8 @@ Relative folder structure is preserved. Managed files are audio (`mp3`, `flac`,
 (including Android player thumbnail caches) are left alone. Empty parents of
 deleted files are removed only when truly empty. Empty source folders are
 not mirrored. Audio formats listed here do not imply Offbeat can play them all.
+Case-only differences in existing folder/file names are renamed to match the
+computer, using an intermediate name for Android's case-insensitive storage.
 
 ## Comparison and interruption
 
@@ -75,7 +77,8 @@ config folder. The phone's music player may need a library rescan afterwards.
 ```
 
 This prints a versioned JSON plan containing source/destination, device serial,
-relative paths to copy/update/delete, unchanged count, and transfer byte count.
+relative paths to copy/update/delete, case-only renames, unchanged count, and
+transfer byte count.
 Progress goes to stderr. Exit status is 0 on success or cancellation, 1 on
 failure, and 130 on interruption. The planner, comparison code, and Android
 transport are separate so Offbeat can initially call the CLI through its process

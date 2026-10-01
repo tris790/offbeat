@@ -2,7 +2,7 @@
 """Mirror Offbeat's music folder to Android over USB; see MUSIC_SYNC.md."""
 
 import argparse
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from decimal import Decimal
 import fcntl
 import hashlib
@@ -47,6 +47,7 @@ class Plan:
     delete: list
     unchanged: int
     bytes: int
+    rename: list = field(default_factory=list)
 
 
 def managed(path):
@@ -233,6 +234,14 @@ class Android:
     def delete(self, path):
         self.shell(f"rm {shlex.quote(self.path(path))}\n")
 
+    def rename(self, before, after):
+        # Use an intermediate name on case-insensitive Android storage.
+        old, new = self.path(before), self.path(after)
+        temp = str(PurePosixPath(old).parent) + "/.offbeat-rename-" + uuid.uuid4().hex
+        self.shell(f"mv {shlex.quote(old)} {shlex.quote(temp)} && "
+                   f"if mv {shlex.quote(temp)} {shlex.quote(new)}; then :; "
+                   f"else mv {shlex.quote(temp)} {shlex.quote(old)}; exit 1; fi\n")
+
     def prune_empty_parents(self, paths):
         parents = set()
         for path in paths:
@@ -272,6 +281,54 @@ def parse_remote(data):
     return Snapshot(files, dirs, other)
 
 
+def check_case_collisions(snapshot):
+    case_paths = {}
+    for path in sorted(set(snapshot.files) | snapshot.dirs | snapshot.other):
+        key = path.casefold()
+        if key in case_paths and case_paths[key] != path:
+            raise SyncError(f"Case-colliding paths on Android: {case_paths[key]!r}, {path!r}")
+        case_paths[key] = path
+
+
+def renamed_path(path, before, after):
+    if path == before:
+        return after
+    if path.startswith(before + "/"):
+        return after + path[len(before):]
+    return path
+
+
+def renamed_snapshot(snapshot, before, after):
+    return Snapshot({renamed_path(p, before, after): e for p, e in snapshot.files.items()},
+                    {renamed_path(p, before, after) for p in snapshot.dirs},
+                    {renamed_path(p, before, after) for p in snapshot.other})
+
+
+def align_case(source, dest):
+    """Plan case-only renames, retaining original paths for content comparison."""
+    check_case_collisions(source)
+    check_case_collisions(dest)
+    aligned, renames = dest, []
+    original = {p: p for p in dest.files}
+    folded_dirs = {p.casefold(): p for p in aligned.dirs}
+    for desired in sorted(source.dirs, key=lambda p: (len(PurePosixPath(p).parts), p)):
+        existing = folded_dirs.get(desired.casefold())
+        if existing and existing != desired:
+            renames.append([existing, desired])
+            aligned = renamed_snapshot(aligned, existing, desired)
+            original = {renamed_path(p, existing, desired): old for p, old in original.items()}
+            folded_dirs = {p.casefold(): p for p in aligned.dirs}
+    folded_files = {p.casefold(): p for p in aligned.files}
+    for desired in sorted(source.files):
+        existing = folded_files.get(desired.casefold())
+        if existing and existing != desired:
+            renames.append([existing, desired])
+            aligned = renamed_snapshot(aligned, existing, desired)
+            original = {renamed_path(p, existing, desired): old for p, old in original.items()}
+    check_collisions(source, aligned)
+    return aligned, renames, original
+
+
 def check_collisions(source, dest):
     for path in source.files:
         if path in dest.dirs or path in dest.other:
@@ -281,7 +338,7 @@ def check_collisions(source, dest):
             if str(parent) in dest.files or str(parent) in dest.other:
                 raise SyncError(f"Phone file blocks a music folder: {str(parent)!r}")
             parent = parent.parent
-    # Android shared storage is commonly case-insensitive.
+    # Reject file/directory conflicts that differ only by case, too.
     case_paths = {}
     for path in sorted(set(source.files) | source.dirs | set(dest.files) | dest.dirs | dest.other):
         key = path.casefold()
@@ -290,15 +347,16 @@ def check_collisions(source, dest):
         case_paths[key] = path
 
 
-def make_plan(source, dest, same):
+def make_plan(source, dest, same, rename=None):
     check_collisions(source, dest)
     copy = sorted(source.files.keys() - dest.files.keys())
     update = sorted(p for p in source.files.keys() & dest.files.keys() if p not in same)
     delete = sorted(dest.files.keys() - source.files.keys())
-    return Plan(copy, update, delete, len(same), sum(source.files[p].size for p in copy + update))
+    return Plan(copy, update, delete, len(same), sum(source.files[p].size for p in copy + update), rename or [])
 
 
-def compare(root, source, dest, android, cache, checksum, progress):
+def compare(root, source, dest, android, cache, checksum, progress, original=None):
+    original = original or {p: p for p in dest.files}
     same, verified, candidates = set(), {}, []
     for path in sorted(source.files.keys() & dest.files.keys()):
         left, right = source.files[path], dest.files[path]
@@ -314,10 +372,10 @@ def compare(root, source, dest, android, cache, checksum, progress):
     for offset in range(0, len(candidates), 64):
         batch = candidates[offset:offset + 64]
         progress(f"Checking contents: {min(offset + 64, len(candidates))}/{len(candidates)}")
-        hashes = android.hashes(batch)
+        hashes = android.hashes([original[p] for p in batch])
         for path in batch:
             digest = file_hash(root / path, source.files[path])
-            if digest == hashes[path]:
+            if digest == hashes[original[path]]:
                 same.add(path)
                 verified[path] = {"local": source.files[path].signature(), "phone": dest.files[path].signature(), "sha256": digest}
     return same, verified
@@ -326,6 +384,10 @@ def compare(root, source, dest, android, cache, checksum, progress):
 def apply_plan(root, source, dest, plan, android, keep_extra, progress):
     if local_scan(root) != source or android.scan() != dest:
         raise SyncError("Folders changed after the preview; run sync again.")
+    for before, after in plan.rename:
+        progress(f"Renaming {before!r} -> {after!r}")
+        android.rename(before, after)
+        dest = renamed_snapshot(dest, before, after)
     copied = {}
     for i, path in enumerate(plan.copy + plan.update, 1):
         progress(f"Copying {i}/{len(plan.copy) + len(plan.update)}: {path!r}")
@@ -380,29 +442,32 @@ def main(argv=None):
         progress = lambda message: print(message, file=sys.stderr, flush=True)
         progress(f"Computer: {root}\nPhone: {android.serial}:{android.root}")
         dest = android.scan()
-        check_collisions(source, dest)
+        aligned, renames, original = align_case(source, dest)
         key = hashlib.sha256(f"{root}\0{android.serial}\0{android.root}".encode()).hexdigest()[:24]
         cache_path = state_dir / f"checksums-{key}.json"
         cache = read_json(cache_path)
         if not isinstance(cache, dict):
             cache = {}
-        same, verified = compare(root, source, dest, android, cache, args.checksum, progress)
+        same, verified = compare(root, source, aligned, android, cache, args.checksum, progress, original)
         # Comparison cache is only an optimization, not a sync baseline. A
         # preview can cache verified pairs without changing either library.
         if local_scan(root) != source or android.scan() != dest:
             raise SyncError("Folders changed during comparison; run sync again.")
         write_json(cache_path, verified)
-        plan = make_plan(source, dest, same)
+        plan = make_plan(source, aligned, same, renames)
         summary = {"version": 1, "source": str(root), "serial": android.serial, "destination": android.root,
                    "keep_extra": args.keep_extra, **asdict(plan)}
         if args.json:
             print(json.dumps(summary, ensure_ascii=True, indent=2), flush=True)
         else:
+            for before, after in plan.rename:
+                print(f"RENAME {before!r} -> {after!r}")
             for label, paths in (("COPY", plan.copy), ("UPDATE", plan.update), ("KEEP" if args.keep_extra else "DELETE", plan.delete)):
                 for path in paths:
                     print(f"{label:6} {path!r}")
             print(f"{len(plan.copy)} new, {len(plan.update)} updated, {len(plan.delete)} "
-                  f"{'kept' if args.keep_extra else 'deleted'}, {plan.unchanged} unchanged; {plan.bytes / 1024**2:.1f} MiB to copy.", flush=True)
+                  f"{'kept' if args.keep_extra else 'deleted'}, {len(plan.rename)} renamed, "
+                  f"{plan.unchanged} unchanged; {plan.bytes / 1024**2:.1f} MiB to copy.", flush=True)
         if not args.apply:
             progress("Preview only. Run with --apply to sync.")
             return 0

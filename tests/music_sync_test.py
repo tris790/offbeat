@@ -13,6 +13,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+sys.dont_write_bytecode = True
 
 spec = importlib.util.spec_from_file_location("music_sync", Path(__file__).resolve().parents[1] / "tools/music_sync.py")
 sync = importlib.util.module_from_spec(spec)
@@ -59,8 +60,22 @@ class MusicSyncTest(unittest.TestCase):
     def plan(self, cache=None, checksum=False):
         source = sync.local_scan(self.root)
         dest = self.phone.scan()
-        same, verified = sync.compare(self.root, source, dest, self.phone, cache or {}, checksum, lambda _: None)
-        return source, dest, sync.make_plan(source, dest, same), verified
+        aligned, renames, original = sync.align_case(source, dest)
+        same, verified = sync.compare(self.root, source, aligned, self.phone, cache or {}, checksum, lambda _: None, original)
+        return source, dest, sync.make_plan(source, aligned, same, renames), verified
+
+    def test_case_only_folder_and_file_renames_preserve_data(self):
+        self.put(self.root, "Hip Hop/Army of the Pharaohs/song.mp3", b"same")
+        self.put(self.phone_root, "Hip Hop/Army Of The Pharaohs/SONG.mp3", b"same")
+        self.put(self.phone_root, "Hip Hop/Army Of The Pharaohs/.cache/data")
+        self.put(self.phone_root, "Hip Hop/Army Of The Pharaohs/old.mp3")
+        source, dest, plan, _ = self.plan()
+        self.assertEqual(len(plan.rename), 2)
+        self.assertEqual(plan.copy + plan.update, [])
+        self.assertEqual(plan.delete, ["Hip Hop/Army of the Pharaohs/old.mp3"])
+        _, final = sync.apply_plan(self.root, source, dest, plan, self.phone, False, lambda _: None)
+        self.assertEqual(set(final.files), set(source.files))
+        self.assertTrue((self.phone_root / "Hip Hop/Army of the Pharaohs/.cache/data").exists())
 
     def test_mirror_handles_content_changes_and_hostile_filenames(self):
         weird = "Rock/Artist's $(touch PWNED); 雪\nnew.mp3"
@@ -221,6 +236,29 @@ class MusicSyncTest(unittest.TestCase):
         self.assertTrue((self.phone_root / "new.mp3").exists())
         self.assertFalse((self.phone_root / "delete.mp3").exists())
         self.assertEqual(json.loads((config / "music-sync/profile.json").read_text())["serial"], "test-phone")
+
+    def test_transport_selects_only_authorized_usb_devices(self):
+        devices = (b"List of devices attached\n"
+                   b"wifi:5555 device product:phone transport_id:2\n"
+                   b"locked unauthorized usb:1-2 transport_id:3\n"
+                   b"usb-phone device usb:1-4 product:phone transport_id:4\n")
+        result = subprocess.CompletedProcess([], 0, stdout=devices, stderr=b"")
+        with patch.object(sync.subprocess, "run", return_value=result):
+            self.assertEqual(sync.Android("adb").serial, "usb-phone")
+            with self.assertRaises(sync.SyncError):
+                sync.Android("adb", "wifi:5555")
+            with self.assertRaises(sync.SyncError):
+                sync.Android("adb", "locked")
+
+    def test_destination_rejects_storage_roots_and_app_data(self):
+        for root in ("/", "/storage/emulated/0", "/storage/ABCD-1234", "/storage/emulated/0/Android/data", "/data/local/tmp"):
+            with patch.object(self.phone, "shell", return_value=(root + "\n").encode()):
+                with self.assertRaises(sync.SyncError):
+                    self.phone.set_root(root)
+        for root in ("/storage/emulated/0/Music", "/storage/ABCD-1234/Music"):
+            with patch.object(self.phone, "shell", return_value=(root + "\n").encode()):
+                self.phone.set_root(root)
+            self.assertEqual(self.phone.root, root)
 
 
 if __name__ == "__main__":
