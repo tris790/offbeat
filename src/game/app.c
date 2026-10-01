@@ -1660,6 +1660,12 @@ static void draw_tab_bar(App *app, f32 x0, f32 y, f32 panel_w) {
         Ui_Interact it = ui_interact(ui, id, vec2_make(x - S(12), y - S(22)), vec2_make(w + S(24), S(44)),
                                      PLATFORM_CURSOR_HAND);
         if (it.clicked) {
+            if (app->filter_focus >= 0) {
+                Panel_Filter *f = &app->filters[app->filter_focus];
+                if (!f->len) f->open = false;
+                f->select_all = false;
+                app->filter_focus = -1;
+            }
             if (app->tab == i && i == TAB_ARTISTS) app->artist_open = -1;
             if (app->tab == i && i == TAB_GENRES) app->genre_open = -1;
             if (app->tab == i && i == TAB_QUEUE) app->queue_follow = true;
@@ -1784,6 +1790,246 @@ static void draw_queue_list(App *app, vec2 pos, vec2 size, b32 playing) {
     CORE_UNUSED(ui);
 }
 
+static s32 game_panel_filter_scope(App *app) {
+    if (app->tab == TAB_QUEUE) return -1;
+    if (app->lib && app->tab == TAB_ARTISTS && app->artist_open >= 0 && (u32)app->artist_open < app->lib->artist_count) return TAB_COUNT;
+    if (app->lib && app->tab == TAB_GENRES && app->genre_open >= 0 && (u32)app->genre_open < app->lib->genre_count) return TAB_COUNT + 1;
+    return (s32)app->tab;
+}
+
+static void game_panel_filter_changed(App *app, s32 scope) {
+    app->filter_cached_scope = -1;
+    app->filters[scope].edited_at = app->now;
+    app->scroll[scope] = (Scroll){0};
+}
+
+static void game_panel_filter_open(App *app, s32 scope) {
+    Panel_Filter *f = &app->filters[scope];
+    f->open = true;
+    f->caret = f->len;
+    f->select_all = false;
+    f->edited_at = app->now;
+    app->filter_focus = scope;
+}
+
+static u32 game_filter_prev(const Panel_Filter *f, u32 at) {
+    if (!at) return 0;
+    at--;
+    while (at && (f->query[at] & 0xC0) == 0x80) at--;
+    return at;
+}
+
+static u32 game_filter_next(const Panel_Filter *f, u32 at) {
+    return at < f->len ? at + core_utf8_decode((Core_String){(u8 *)f->query, f->len}, at).size : at;
+}
+
+/* Consume editing before global playback/type-to-search shortcuts. */
+static b32 game_panel_filter_input(App *app, const Platform_Input *in) {
+    s32 scope = game_panel_filter_scope(app);
+    if (in->ctrl && in->key_pressed[PLATFORM_KEY_F] && scope >= 0) {
+        game_panel_filter_open(app, scope);
+        return true;
+    }
+    if (scope < 0 || app->filter_focus != scope) { app->filter_focus = -1; return false; }
+    Panel_Filter *f = &app->filters[scope];
+    if (in->key_pressed[PLATFORM_KEY_TAB]) { app->filter_focus = -1; if (!f->len) f->open = false; return false; }
+    if (in->key_pressed[PLATFORM_KEY_ENTER]) { app->filter_focus = -1; if (!f->len) f->open = false; return true; }
+    if (in->key_pressed[PLATFORM_KEY_ESCAPE]) {
+        if (f->len) { f->len = f->caret = 0; f->select_all = false; game_panel_filter_changed(app, scope); }
+        else { f->open = false; app->filter_focus = -1; }
+        return true;
+    }
+    if (in->ctrl && in->key_pressed[PLATFORM_KEY_A]) f->select_all = true;
+    if (in->key_pressed[PLATFORM_KEY_HOME]) { f->caret = 0; f->select_all = false; }
+    if (in->key_pressed[PLATFORM_KEY_END]) { f->caret = f->len; f->select_all = false; }
+    if (in->key_pressed[PLATFORM_KEY_LEFT]) {
+        f->caret = f->select_all ? 0 : game_filter_prev(f, f->caret);
+        if (in->ctrl) {
+            while (f->caret && f->query[f->caret] == ' ') f->caret = game_filter_prev(f, f->caret);
+            while (f->caret && f->query[game_filter_prev(f, f->caret)] != ' ') f->caret = game_filter_prev(f, f->caret);
+        }
+        f->select_all = false;
+    }
+    if (in->key_pressed[PLATFORM_KEY_RIGHT]) {
+        f->caret = f->select_all ? f->len : game_filter_next(f, f->caret);
+        if (in->ctrl) {
+            while (f->caret < f->len && f->query[f->caret] != ' ') f->caret = game_filter_next(f, f->caret);
+            while (f->caret < f->len && f->query[f->caret] == ' ') f->caret = game_filter_next(f, f->caret);
+        }
+        f->select_all = false;
+    }
+    u32 from = f->caret, to = f->caret;
+    b32 back = in->key_pressed[PLATFORM_KEY_BACKSPACE], del = in->key_pressed[PLATFORM_KEY_DELETE];
+    b32 typing = in->text_len && !in->ctrl && !in->alt;
+    if (f->select_all && (back || del || typing)) { from = 0; to = f->len; f->select_all = false; }
+    else if (back) {
+        from = game_filter_prev(f, from);
+        if (in->ctrl) {
+            while (from && f->query[from] == ' ') from = game_filter_prev(f, from);
+            while (from && f->query[game_filter_prev(f, from)] != ' ') from = game_filter_prev(f, from);
+        }
+    } else if (del) to = game_filter_next(f, to);
+    if (to > from) {
+        memmove(f->query + from, f->query + to, f->len - to);
+        f->len -= to - from; f->caret = from;
+        game_panel_filter_changed(app, scope);
+    }
+    if (typing) {
+        u32 n = 0;
+        while (n < in->text_len) {
+            Core_Utf8Decode d = core_utf8_decode((Core_String){(u8 *)in->text, in->text_len}, n);
+            if (n + d.size > in->text_len || f->len + n + d.size > sizeof(f->query) - 1) break;
+            n += d.size;
+        }
+        if (n) {
+            memmove(f->query + f->caret + n, f->query + f->caret, f->len - f->caret);
+            memcpy(f->query + f->caret, in->text, n);
+            f->len += n; f->caret += n;
+            game_panel_filter_changed(app, scope);
+        }
+    }
+    if (in->any_event) f->edited_at = app->now;
+    return true;
+}
+
+/* NULL source denotes a named-group list; returned indices retain library order.
+   Unfiltered song views borrow the library array without allocating. */
+static const u32 *game_panel_filter_results(App *app, s32 scope, const u32 *source, u32 total, u32 *count) {
+    Panel_Filter *f = &app->filters[scope];
+    if (!f->len) { *count = total; return source; }
+    if (app->filter_cached_scope != scope || app->filter_cached_source != source || app->filter_cached_total != total) {
+        Game_Filter query;
+        game_filter_compile(&query, (Core_String){f->query, f->len});
+        if (total > app->filter_capacity) {
+            u32 *indices = core_heap_realloc(app->filter_indices, sizeof(u32) * (u64)total);
+            if (!indices) { *count = total; return source; }
+            app->filter_indices = indices;
+            app->filter_capacity = total;
+        }
+        app->filter_count = 0;
+        for (u32 i = 0; i < total; i++) {
+            u32 index = source ? source[i] : i;
+            Core_String fields[3];
+            u32 n = 1;
+            if (source) {
+                const Lib_Track *t = &app->lib->tracks[index];
+                fields[0] = t->title; fields[1] = t->artist; fields[2] = t->album; n = 3;
+            } else fields[0] = scope == TAB_ARTISTS ? app->lib->artists[index].name : app->lib->genres[index].name;
+            if (game_filter_matches(&query, fields, n)) app->filter_indices[app->filter_count++] = index;
+        }
+        app->filter_cached_scope = scope;
+        app->filter_cached_source = source;
+        app->filter_cached_total = total;
+    }
+    *count = app->filter_count;
+    return app->filter_indices;
+}
+
+static const u32 *game_draw_filter_header(App *app, vec2 *pos, vec2 *size, s32 scope,
+                                         const u32 *source, u32 total, u32 *count) {
+    Ui *ui = &app->ui;
+    Panel_Filter *f = &app->filters[scope];
+    const char *noun = scope == TAB_GENRES ? "genre" : scope == TAB_ARTISTS ? "artist" : "song";
+    const char *placeholder = scope == TAB_GENRES ? "Filter genres" : scope == TAB_ARTISTS ? "Filter artists" : "Filter songs";
+    u64 id = ui_idx(ui_id("panel.filter"), (u64)scope);
+    const u32 *indices = game_panel_filter_results(app, scope, source, total, count);
+    Core_String label = f->len ? str_fmt(app, "%u of %u %s%s", *count, total, noun, total == 1 ? "" : "s") :
+                               str_fmt(app, "%u %s%s", total, noun, total == 1 ? "" : "s");
+    f32 hh = S(34), bh = S(28), cy = pos->y + hh * 0.5f;
+    f32 label_w = ui_text_width(ui, ui->font, label, S(13));
+    f32 max_w = CORE_MIN(S(236), CORE_MAX(S(100), size->x - label_w - S(42)));
+    f32 reveal = clamp01(ui_spring(ui, ui_idx(id, 1), f->open ? 1 : 0, 480, 40));
+    f32 bw = S(28) + (max_w - S(28)) * reveal;
+    vec2 bp = vec2_make(pos->x + size->x - S(8) - bw, cy - bh * 0.5f);
+    vec2 bs = vec2_make(bw, bh);
+    b32 focused = app->filter_focus == scope;
+    f32 focus = ui_ease(ui, ui_idx(id, 2), focused && ui->input_enabled ? 1 : 0, 16);
+    Ui_Interact close = {0};
+    if (f->open && reveal > 0.5f) {
+        close = ui_interact(ui, ui_idx(id, 3), vec2_make(bp.x + bw - S(28), bp.y), vec2_make(S(28), bh), PLATFORM_CURSOR_HAND);
+        if (close.clicked) {
+            if (f->len) {
+                f->len = f->caret = 0; f->select_all = false;
+                game_panel_filter_changed(app, scope);
+                game_panel_filter_open(app, scope);
+            } else { f->open = false; app->filter_focus = -1; }
+        }
+    }
+    Ui_Interact field = ui_interact(ui, ui_idx(id, 4), bp, bs, f->open ? PLATFORM_CURSOR_TEXT : PLATFORM_CURSOR_HAND);
+    if (field.clicked) {
+        u32 old_caret = f->caret;
+        game_panel_filter_open(app, scope);
+        if (reveal > 0.95f) {
+            f32 target = ui->in->mouse_pos.x - bp.x - S(30);
+            f32 caret_w = ui_text_width(ui, ui->font, (Core_String){f->query, old_caret}, S(13));
+            f32 available = CORE_MAX(0, bw - S(64));
+            target += CORE_MAX(0, caret_w - available);
+            f->caret = f->len;
+            for (u32 at = 0; at < f->len; ) {
+                u32 next = game_filter_next(f, at);
+                f32 w0 = ui_text_width(ui, ui->font, (Core_String){f->query, at}, S(13));
+                f32 w1 = ui_text_width(ui, ui->font, (Core_String){f->query, next}, S(13));
+                if (target < (w0 + w1) * 0.5f) { f->caret = at; break; }
+                at = next;
+            }
+        }
+    }
+    if (focused && ui->input_enabled && ui->in->mouse_pressed[PLATFORM_MOUSE_LEFT] && !ui_mouse_in(ui, bp, bs)) {
+        app->filter_focus = -1;
+        f->select_all = false;
+        if (!f->len) f->open = false;
+    }
+    focused = app->filter_focus == scope && ui->input_enabled;
+    core_draw_rect_rounded(app->r, bp, bs, S(8), UI_RGBA(155, 123, 255, reveal * (0.055f + focus * 0.045f) + field.hover_t * 0.04f));
+    if (focus > 0.01f)
+        core_draw_rect_rounded(app->r, vec2_make(bp.x + S(8), bp.y + bh - S(1)), vec2_make(bw - S(16), S(1)), S(0.5f), ui_alpha(UI_ACCENT_BRIGHT, reveal * focus * 0.65f));
+    ui_icon_search(ui, vec2_make(bp.x + S(14), cy), S(15) * (1 - field.press_t * 0.1f), ui_mix(UI_TEXT_DIM, UI_LAVENDER, CORE_MAX(focus, field.hover_t)));
+    if (reveal > 0.05f) {
+        f32 tx = bp.x + S(30), available = CORE_MAX(0, bw - S(60));
+        Core_String text = {f->query, f->len};
+        f32 caret_w = ui_text_width(ui, ui->font, (Core_String){f->query, f->caret}, S(13));
+        f32 offset = CORE_MAX(0, caret_w - CORE_MAX(0, available - S(4)));
+        core_clip_push(app->r, vec2_make(tx, bp.y), vec2_make(available, bh));
+        if (focused && f->select_all)
+            core_draw_rect_rounded(app->r, vec2_make(tx - offset, cy - S(9)), vec2_make(ui_text_width(ui, ui->font, text, S(13)), S(18)), S(3), UI_RGBA(155, 123, 255, 0.25f));
+        ui_text(ui, ui->font, f->len ? text : core_str(placeholder), tx - offset, cy, S(13), ui_alpha(f->len ? UI_TEXT : UI_TEXT_DIM, reveal), UI_ALIGN_LEFT, 0);
+        if (focused && ui->in->focused && !f->select_all) {
+            f32 blink = fmodf((f32)(app->now - f->edited_at), 1.0f) < 0.58f ? 1 : 0.2f;
+            core_draw_rect(app->r, vec2_make(tx + caret_w - offset, cy - S(7)), vec2_make(S(1), S(14)), ui_alpha(UI_LAVENDER, blink * reveal));
+            ui->animating = true;
+        }
+        core_clip_pop(app->r);
+        if (reveal > 0.5f) {
+            vec2 cc = vec2_make(bp.x + bw - S(14), cy);
+            if (close.hover_t > 0.01f) core_draw_circle(app->r, cc, S(10), UI_RGBA(255, 255, 255, 0.08f * close.hover_t));
+            ui_icon_close(ui, cc, S(11), ui_alpha(ui_mix(UI_TEXT_DIM, UI_TEXT, close.hover_t), reveal));
+        }
+    }
+    /* Clear clicks update the count and rows in this same frame. */
+    indices = game_panel_filter_results(app, scope, source, total, count);
+    label = f->len ? str_fmt(app, "%u of %u %s%s", *count, total, noun, total == 1 ? "" : "s") :
+                     str_fmt(app, "%u %s%s", total, noun, total == 1 ? "" : "s");
+    ui_text(ui, ui->font, label, pos->x + S(14), cy, S(13), UI_TEXT_DIM, UI_ALIGN_LEFT, bp.x - pos->x - S(24));
+    pos->y += hh; size->y -= hh;
+    return indices;
+}
+
+static void game_draw_filter_empty(App *app, vec2 pos, vec2 size, s32 scope) {
+    Ui *ui = &app->ui;
+    f32 cy = pos.y + CORE_MIN(size.y * 0.32f, S(150));
+    ui_icon_search(ui, vec2_make(pos.x + size.x * 0.5f, cy - S(34)), S(25), UI_TEXT_FAINT);
+    ui_text(ui, ui->font, core_str("No matches"), pos.x + size.x * 0.5f, cy, S(16), UI_TEXT_DIM, UI_ALIGN_CENTER, 0);
+    vec2 bp = vec2_make(pos.x + size.x * 0.5f - S(55), cy + S(16)), bs = vec2_make(S(110), S(30));
+    Ui_Interact it = ui_interact(ui, ui_idx(ui_id("filter.reset"), (u64)scope), bp, bs, PLATFORM_CURSOR_HAND);
+    if (it.hover_t > 0.01f) core_draw_rect_rounded(app->r, bp, bs, S(8), UI_RGBA(155, 123, 255, 0.07f * it.hover_t));
+    ui_text(ui, ui->font, core_str("Clear filter"), bp.x + bs.x * 0.5f, bp.y + bs.y * 0.5f, S(13), ui_mix(UI_TEXT_DIM, UI_LAVENDER, it.hover_t), UI_ALIGN_CENTER, 0);
+    if (it.clicked) {
+        app->filters[scope].len = app->filters[scope].caret = 0;
+        game_panel_filter_changed(app, scope);
+        game_panel_filter_open(app, scope);
+    }
+}
+
 static void draw_songs_list(App *app, vec2 pos, vec2 size, const u32 *tracks, u32 count, Scroll *sc, u64 list_id, b32 playing) {
     Ui *ui = &app->ui;
     f32 row_h = S(58);
@@ -1821,7 +2067,7 @@ static void group_get(const Library *lib, Group_Kind k, u32 i, Core_String *name
     }
 }
 
-static void draw_groups(App *app, vec2 pos, vec2 size, b32 playing, Group_Kind kind) {
+static void draw_groups(App *app, vec2 pos, vec2 size, b32 playing, Group_Kind kind, const u32 *filtered, u32 shown) {
     Ui *ui = &app->ui;
     Library *lib = app->lib;
     b32 artists = kind == GROUP_ARTIST;
@@ -1844,34 +2090,40 @@ static void draw_groups(App *app, vec2 pos, vec2 size, b32 playing, Group_Kind k
         Ui_Interact it = ui_interact(ui, bid, vec2_make(pos.x, pos.y + S(2)), vec2_make(size.x - S(8), hh - S(4)), PLATFORM_CURSOR_HAND);
         if (it.hover_t > 0.01f) core_draw_rect_rounded(app->r, vec2_make(pos.x, pos.y + S(2)), vec2_make(size.x - S(8), hh - S(4)), S(9), UI_RGBA(255, 255, 255, 0.04f * it.hover_t));
         ui_icon_chevron_left(ui, vec2_make(pos.x + S(20) - S(3) * it.hover_t, pos.y + hh * 0.5f), S(22), UI_TEXT);
-        ui_text(ui, ui->font_semi, name, pos.x + S(40), pos.y + hh * 0.5f, S(17), UI_TEXT, UI_ALIGN_LEFT, size.x - S(150));
+        ui_text(ui, ui->font_semi, name, pos.x + S(40), pos.y + hh * 0.5f, S(17), UI_TEXT, UI_ALIGN_LEFT, size.x - S(90));
         if (kb.hover_t > 0.01f) core_draw_circle(app->r, kc, S(14), UI_RGBA(255, 255, 255, 0.07f * kb.hover_t));
         ui_icon_kebab(ui, kc, S(14), ui_mix(UI_TEXT_DIM, UI_TEXT, kb.hover_t));
-        ui_text(ui, ui->font, str_fmt(app, "%u song%s", track_count, track_count == 1 ? "" : "s"),
-                pos.x + size.x - S(46), pos.y + hh * 0.5f, S(13), UI_TEXT_DIM, UI_ALIGN_RIGHT, 0);
         if (kb.clicked || it.right_clicked) {
             if (artists) open_artist_menu(app, (u32)*open); else open_genre_menu(app, (u32)*open);
             return;
         }
-        if (it.clicked || ui->in->key_pressed[PLATFORM_KEY_BACKSPACE]) { *open = -1; return; }
+        if (it.clicked || (ui->input_enabled && app->filter_focus < 0 && ui->in->key_pressed[PLATFORM_KEY_BACKSPACE])) {
+            *open = -1; app->filter_focus = -1; return;
+        }
         u64 slide_id = ui_id(artists ? "artist.slide" : "genre.slide");
         f32 slide = ui_ease(ui, slide_id, 1.0f, 12.0f);
         vec2 lp = vec2_make(pos.x + S(30) * (1 - slide), pos.y + hh);
-        draw_songs_list(app, lp, vec2_make(size.x, size.y - hh), tracks, track_count, open_scroll,
-                        ui_idx(ui_id(artists ? "list.artist" : "list.genre"), (u64)*open), playing);
+        if (!shown && track_count) game_draw_filter_empty(app, lp, vec2_make(size.x, size.y - hh), artists ? TAB_COUNT : TAB_COUNT + 1);
+        else draw_songs_list(app, lp, vec2_make(size.x, size.y - hh), filtered, shown, open_scroll,
+                            ui_idx(ui_id(artists ? "list.artist" : "list.genre"), (u64)*open), playing);
         return;
     }
 
     f32 row_h = S(58);
-    List_View lv = list_begin(app, list_scroll, ui_id(artists ? "list.artists" : "list.genres"), pos, size, total, row_h, S(3));
+    if (!shown && app->filters[artists ? TAB_ARTISTS : TAB_GENRES].len) {
+        game_draw_filter_empty(app, pos, size, artists ? TAB_ARTISTS : TAB_GENRES);
+        return;
+    }
+    List_View lv = list_begin(app, list_scroll, ui_id(artists ? "list.artists" : "list.genres"), pos, size, shown, row_h, S(3));
     const Lib_Track *curt = current_track(app);
-    for (u32 i = lv.first; i < lv.last; i++) {
+    for (u32 row = lv.first; row < lv.last; row++) {
+        u32 i = filtered ? filtered[row] : row;
         Core_String name;
         const u32 *tracks;
         u32 track_count;
         group_get(lib, kind, i, &name, &tracks, &track_count);
         if (!track_count) continue;
-        f32 y = lv.y0 + (f32)i * row_h;
+        f32 y = lv.y0 + (f32)row * row_h;
         vec2 rp = vec2_make(pos.x, y + S(1)), rs = vec2_make(size.x - S(8), row_h - S(2));
         u64 id = ui_idx(ui_id(artists ? "ar.row" : "ge.row"), i);
         vec2 kc = vec2_make(rp.x + rs.x - S(46), rp.y + rs.y * 0.5f);
@@ -1897,6 +2149,7 @@ static void draw_groups(App *app, vec2 pos, vec2 size, b32 playing, Group_Kind k
             if (artists) open_artist_menu(app, i); else open_genre_menu(app, i);
         } else if (it.clicked) {
             *open = (s32)i;
+            app->filter_focus = -1;
             *open_scroll = (Scroll){0};
             ui_anim_set(ui, ui_id(artists ? "artist.slide" : "genre.slide"), 0);
         }
@@ -1918,19 +2171,39 @@ static void draw_panel(App *app, f32 x0, f32 w, f32 h, b32 playing) {
     vec2 ls = vec2_make(w - S(29) - S(15), h - lp.y - S(6));
     /* fade lists in/out when switching tabs */
     if (!app->lib) { draw_skeleton_rows(app, lp, ls, S(58)); return; }
+    const u32 *filtered = 0;
+    u32 shown = 0;
+    s32 scope = game_panel_filter_scope(app);
+    if (scope >= 0) {
+        const u32 *source = 0;
+        u32 total;
+        if (scope == TAB_COUNT) {
+            Lib_Artist *a = &app->lib->artists[app->artist_open];
+            source = a->tracks; total = a->track_count;
+        } else if (scope == TAB_COUNT + 1) {
+            Lib_Genre *g = &app->lib->genres[app->genre_open];
+            source = g->tracks; total = g->track_count;
+        } else if (scope == TAB_SONGS) { source = app->lib->by_title; total = app->lib->track_count; }
+        else total = scope == TAB_ARTISTS ? app->lib->artist_count : app->lib->genre_count;
+        if (scope >= TAB_COUNT && app->filters[scope].source != source) {
+            app->filters[scope] = (Panel_Filter){ .source = source };
+            app->filter_cached_scope = -1;
+        }
+        filtered = game_draw_filter_header(app, &lp, &ls, scope, source, total, &shown);
+    }
     switch (app->tab) {
         case TAB_QUEUE:
             draw_queue_list(app, lp, ls, playing);
             break;
         case TAB_GENRES:
-            draw_groups(app, lp, ls, playing, GROUP_GENRE);
+            draw_groups(app, lp, ls, playing, GROUP_GENRE, filtered, shown);
             break;
         case TAB_ARTISTS:
-            draw_groups(app, lp, ls, playing, GROUP_ARTIST);
+            draw_groups(app, lp, ls, playing, GROUP_ARTIST, filtered, shown);
             break;
         default:
-            draw_songs_list(app, lp, ls, app->lib->by_title, app->lib->track_count, &app->scroll[TAB_SONGS],
-                            ui_id("list.songs"), playing);
+            if (!shown && app->filters[TAB_SONGS].len) game_draw_filter_empty(app, lp, ls, TAB_SONGS);
+            else draw_songs_list(app, lp, ls, filtered, shown, &app->scroll[TAB_SONGS], ui_id("list.songs"), playing);
             break;
     }
     /* soft fade at the list's top/bottom edges */
@@ -3048,6 +3321,7 @@ static void handle_shortcuts(App *app, const Platform_Input *in) {
     if (in->key_pressed[PLATFORM_KEY_MEDIA_NEXT]) skip(app, +1);
     if (in->key_pressed[PLATFORM_KEY_MEDIA_PREV]) skip(app, -1);
     if (app->search_open || app->menu || app->settings_open || dlv_is_open(app->dlv)) return;
+    if (app->lib && game_panel_filter_input(app, in)) return;
 
     /* typing a letter opens search with it (fast path to find anything) */
     if (in->text_len && !in->ctrl && !in->alt && in->text[0] != ' ') {
