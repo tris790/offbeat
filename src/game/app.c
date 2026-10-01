@@ -679,8 +679,7 @@ static b32 game_delete_song(App *app, u32 track) {
 static void apply_download_settings(App *app) {
     if (app->settings.download_dir[0]) core_cstr_copy(app->download_dest, sizeof(app->download_dest), app->settings.download_dir);
     else snprintf(app->download_dest, sizeof(app->download_dest), "%s/Downloads", app->music_dir);
-    downloads_configure(app->downloads, app->download_dest, app->settings.download_parallel);
-    downloads_set_library(app->downloads, app->music_dir);
+    downloads_configure(app->downloads, app->download_dest, app->music_dir, app->settings.download_parallel);
 }
 
 static void set_music_dir(App *app, const char *dir) {
@@ -813,6 +812,7 @@ App *app_create(Core_Arena *arena, Core_Renderer *r, Platform_Window *win) {
     app->cache_dir  = platform_env("OFFBEAT_CACHE_DIR") ? platform_env("OFFBEAT_CACHE_DIR") : platform_cache_dir(arena);
     app->config_dir = platform_env("OFFBEAT_CONFIG_DIR") ? platform_env("OFFBEAT_CONFIG_DIR") : platform_config_dir(arena);
     platform_make_dirs(app->cache_dir);
+    platform_make_dirs(app->config_dir); /* queue persistence must work on the first launch */
     snprintf(app->index_path, sizeof(app->index_path), "%s/library.idx", app->cache_dir);
     snprintf(app->state_path, sizeof(app->state_path), "%s/state", app->config_dir);
     snprintf(app->settings_path, sizeof(app->settings_path), "%s/settings", app->config_dir);
@@ -1716,7 +1716,7 @@ static void draw_window_buttons(App *app, f32 right, f32 y) {
     for (u32 i = 0; i < 3; i++) {
         vec2 c = vec2_make(xs[i], y);
         Ui_Interact it = ui_interact(ui, ui_id(names[i]), vec2_make(c.x - S(17), c.y - S(15)), vec2_make(S(34), S(30)),
-                                     PLATFORM_CURSOR_DEFAULT);
+                                     PLATFORM_CURSOR_HAND);
         vec4 bg = i == 2 ? UI_RGBA(232, 72, 96, 0.9f * it.hover_t) : UI_RGBA(255, 255, 255, 0.08f * it.hover_t);
         if (it.hover_t > 0.01f) core_draw_rect_rounded(r, vec2_make(c.x - S(17), c.y - S(13)), vec2_make(S(34), S(26)), S(6), bg);
         vec4 col = ui_mix(UI_RGBA(200, 196, 220, 1), UI_TEXT, it.hover_t);
@@ -1936,7 +1936,10 @@ static const u32 *game_draw_filter_header(App *app, vec2 *pos, vec2 *size, s32 s
     b32 focused = app->filter_focus == scope;
     f32 focus = ui_ease(ui, ui_idx(id, 2), focused && ui->input_enabled ? 1 : 0, 16);
     Ui_Interact close = {0};
+    vec2 field_size = bs;
     if (f->open && reveal > 0.5f) {
+        /* The close button owns the right end, including its cursor. */
+        field_size.x -= S(28);
         close = ui_interact(ui, ui_idx(id, 3), vec2_make(bp.x + bw - S(28), bp.y), vec2_make(S(28), bh), PLATFORM_CURSOR_HAND);
         if (close.clicked) {
             if (f->len) {
@@ -1946,7 +1949,7 @@ static const u32 *game_draw_filter_header(App *app, vec2 *pos, vec2 *size, s32 s
             } else { f->open = false; app->filter_focus = -1; }
         }
     }
-    Ui_Interact field = ui_interact(ui, ui_idx(id, 4), bp, bs, f->open ? PLATFORM_CURSOR_TEXT : PLATFORM_CURSOR_HAND);
+    Ui_Interact field = ui_interact(ui, ui_idx(id, 4), bp, field_size, f->open ? PLATFORM_CURSOR_TEXT : PLATFORM_CURSOR_HAND);
     if (field.clicked) {
         u32 old_caret = f->caret;
         game_panel_filter_open(app, scope);

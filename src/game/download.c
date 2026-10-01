@@ -477,6 +477,7 @@ b32 dl_parse_meta_line(const char *line, Dl_Job *job) {
     if (atof(f[6]) > 0) job->duration_s = (u32)atof(f[6]);
     if (f[7][0]) core_cstr_copy(job->genre, sizeof(job->genre), f[7]);
     if (atoi(f[9]) > 0) job->track = (u32)atoi(f[9]);
+    job->metadata_ready = true;
     return true;
 }
 
@@ -486,13 +487,14 @@ b32 dl_parse_meta_line(const char *line, Dl_Job *job) {
 
 u64 dl_jobs_format(const Dl_Job *jobs, u32 count, u64 next_uid, char *buf, u64 cap) {
     u64 n = 0;
-    int w = snprintf(buf, cap, "offbeat-downloads 1\nnext_uid %llu\n", (unsigned long long)next_uid);
-    if (w > 0) n = (u64)w;
+    int w = snprintf(buf, cap, "offbeat-downloads 2\nnext_uid %llu\n", (unsigned long long)next_uid);
+    if (w < 0 || (u64)w >= cap) return 0;
+    n = (u64)w;
     for (u32 i = 0; i < count && n + 1 < cap; i++) {
         const Dl_Job *j = &jobs[i];
-        w = snprintf(buf + n, cap - n, "job\t%llu\t%u\t%u\t%s\t%u\t%u\t%u\t%s\t%s\t%s\t%s\t%s\t%s\n",
+        w = snprintf(buf + n, cap - n, "job\t%llu\t%u\t%u\t%s\t%u\t%u\t%u\t%s\t%s\t%s\t%s\t%s\t%s\t%u\n",
                      (unsigned long long)j->uid, j->state, j->attempts, j->vid, j->year, j->track,
-                     j->duration_s, j->title, j->artist, j->album, j->genre, j->path, j->error);
+                     j->duration_s, j->title, j->artist, j->album, j->genre, j->path, j->error, j->metadata_ready);
         if (w < 0 || (u64)w >= cap - n) break; /* out of room: drop the rest rather than half a line */
         n += (u64)w;
     }
@@ -505,6 +507,7 @@ u32 dl_jobs_parse(Core_String text, Dl_Job *out, u32 max, u64 *next_uid) {
     while (at < text.len) {
         u64 end = at;
         while (end < text.len && text.str[end] != '\n') end++;
+        if (end == text.len) break; /* never restore a truncated final record */
         char line[2600];
         u64 n = CORE_MIN(end - at, (u64)sizeof(line) - 1);
         memcpy(line, text.str + at, n);
@@ -515,7 +518,8 @@ u32 dl_jobs_parse(Core_String text, Dl_Job *out, u32 max, u64 *next_uid) {
         if (sscanf(line, "next_uid %llu", &uid) == 1) { if (next_uid) *next_uid = uid; continue; }
         if (strncmp(line, "job\t", 4) != 0 || count >= max) continue;
         char *f[14] = {0};
-        if (split_fields(line + 4, '\t', f, 14) < 13) continue;
+        u32 fields = split_fields(line + 4, '\t', f, 14);
+        if (fields < 13) continue;
         if (!valid_video_id(f[3])) continue;
         Dl_Job *j = &out[count];
         memset(j, 0, sizeof(*j));
@@ -534,6 +538,7 @@ u32 dl_jobs_parse(Core_String text, Dl_Job *out, u32 max, u64 *next_uid) {
         core_cstr_copy(j->genre, sizeof(j->genre), f[10]);
         core_cstr_copy(j->path, sizeof(j->path), f[11]);
         core_cstr_copy(j->error, sizeof(j->error), f[12]);
+        j->metadata_ready = fields >= 14 && atoi(f[13]) != 0;
         j->progress = j->state == DL_DONE ? 1.0f : 0.0f;
         if (!j->uid) continue;
         count++;
@@ -563,7 +568,9 @@ typedef struct {
 
 struct Downloads {
     Platform_Mutex mu;
+    Platform_Mutex save_mu;
     Platform_Cond  cv;
+    u64 save_revision, persisted_revision;
 
     char state_path[1024], work_dir[1024], dest_dir[1024], music_dir[1024];
     char ffmpeg_path[512];
@@ -604,16 +611,37 @@ static Dl_Slot *find_slot(Downloads *d, u64 uid) {
     return 0;
 }
 
-static void save_locked(Downloads *d) {
+static b32 save_locked(Downloads *d) {
+    d->version++;
+    u64 revision = ++d->save_revision;
     u64 cap = 4096 + (u64)d->count * 2600;
     char *buf = core_heap_alloc(cap);
     Dl_Job *jobs = core_heap_alloc(sizeof(Dl_Job) * (d->count ? d->count : 1));
+    if (!buf || !jobs) {
+        core_heap_free(jobs);
+        core_heap_free(buf);
+        return false;
+    }
     for (u32 i = 0; i < d->count; i++) jobs[i] = d->slots[i].j;
-    u64 n = dl_jobs_format(jobs, d->count, d->next_uid, buf, cap);
-    platform_file_write_all(d->state_path, buf, n);
+    u32 count = d->count;
+    u64 next_uid = d->next_uid;
+    /* Callers finish their slot edits before this call: slots may change
+       while the snapshot is serialized/written. Never hold mu on disk I/O.
+       The writer lock and revision prevent an older snapshot replacing a
+       newer one when workers and the UI save at the same time. */
+    platform_mutex_unlock(&d->mu);
+    u64 n = dl_jobs_format(jobs, count, next_uid, buf, cap);
+    platform_mutex_lock(&d->save_mu);
+    b32 saved = revision <= d->persisted_revision;
+    if (!saved) {
+        saved = platform_file_write_all(d->state_path, buf, n);
+        if (saved) d->persisted_revision = revision;
+    }
+    platform_mutex_unlock(&d->save_mu);
     core_heap_free(jobs);
     core_heap_free(buf);
-    d->version++;
+    platform_mutex_lock(&d->mu);
+    return saved;
 }
 
 /* PATH first, then the places tools usually live that a desktop launcher's
@@ -657,7 +685,7 @@ static u32 active_count(Downloads *d) {
 
 /* Oldest queued job that may start now; marks it active. Caller holds mu. */
 static u64 claim_locked(Downloads *d) {
-    if (d->quit || d->paused || !d->tools.ytdlp || !d->tools.ffmpeg) return 0;
+    if (d->quit || d->paused || !d->dest_dir[0] || !d->tools.ytdlp || !d->tools.ffmpeg) return 0;
     f64 now = now_s();
     if (active_count(d) >= d->parallel || now < d->next_start_at) return 0;
     for (u32 i = 0; i < d->count; i++) {
@@ -854,6 +882,14 @@ static void set_proc(Dl_Worker *w, Platform_Process *p) {
     platform_mutex_unlock(&w->d->mu);
 }
 
+/* Cancellation wins over shutdown; every access uses the manager lock. */
+static u32 game_download_stop(Dl_Worker *w) {
+    platform_mutex_lock(&w->d->mu);
+    u32 stop = w->cancel ? 2 : w->d->quit ? 1 : 0;
+    platform_mutex_unlock(&w->d->mu);
+    return stop;
+}
+
 /* What yt-dlp says is for developers; say what to do about the common ones. */
 static const char *friendly_error(const char *msg) {
     static const struct { const char *needle, *say; } map[] = {
@@ -889,7 +925,7 @@ static void take_error_line(const char *line, char *err, u32 cap) {
 }
 
 /* ffmpeg: attach the cover and write every tag. Returns true on success. */
-static b32 tag_file(Downloads *d, const Dl_Job *j, const char *audio, const char *cover, const char *out,
+static b32 tag_file(Dl_Worker *w, const char *ffmpeg, const Dl_Job *j, const char *audio, const char *cover, const char *out,
                     char *err, u32 err_cap) {
     char a_title[DL_TEXT + 8], a_artist[DL_TEXT + 16], a_album[DL_TEXT + 8], a_date[32], a_genre[80],
          a_track[32], a_comment[128], a_vid[32], a_url[64], a_aa[DL_TEXT + 16];
@@ -907,7 +943,7 @@ static b32 tag_file(Downloads *d, const Dl_Job *j, const char *audio, const char
     const char *argv[64]; /* at most ~51 with every tag present */
     u32 n = 0;
     b32 have_cover = cover && cover[0];
-    argv[n++] = d->ffmpeg_path;
+    argv[n++] = ffmpeg;
     argv[n++] = "-hide_banner"; argv[n++] = "-loglevel"; argv[n++] = "error"; argv[n++] = "-y";
     argv[n++] = "-i"; argv[n++] = audio;
     if (have_cover) { argv[n++] = "-i"; argv[n++] = cover; }
@@ -938,12 +974,14 @@ static b32 tag_file(Downloads *d, const Dl_Job *j, const char *audio, const char
 
     Platform_Process *p = platform_process_spawn(argv);
     if (!p) { core_cstr_copy(err, err_cap, "Could not start ffmpeg"); return false; }
+    set_proc(w, p);
     char line[512], last[DL_TEXT] = {0};
     for (;;) {
         s32 r = platform_process_read_line(p, line, sizeof(line), 0.5);
         if (r == -1) break;
         if (r > 0) core_cstr_copy(last, sizeof(last), line);
     }
+    set_proc(w, 0);
     s32 code = platform_process_finish(p);
     if (code != 0) {
         snprintf(err, err_cap, "ffmpeg: %s", last[0] ? last : "tagging failed");
@@ -979,10 +1017,21 @@ static void run_job(Downloads *d, Dl_Worker *w, u64 uid) {
     b32 existed = false;
     char dest[1600] = {0};
 
+    /* A crash can happen after the final rename but before DONE is saved. */
+    if (j.metadata_ready && j.path[0]) {
+        Platform_FileInfo final = platform_file_info(j.path);
+        if (final.exists && !final.is_dir && final.size) {
+            job_done(d, uid, j.path, true);
+            platform_remove_tree(work);
+            return;
+        }
+    }
+
     /* the hint may already name a song the library has (an earlier download) */
     if (j.title[0] && j.artist[0]) existed = plan_dest(&j, music_dir, dest_dir, dest, sizeof(dest));
 
-    if (!existed) {
+    Platform_FileInfo cached_audio = platform_file_info(audio);
+    if (!existed && !(j.metadata_ready && cached_audio.exists && !cached_audio.is_dir && cached_audio.size)) {
         job_progress(d, uid, DL_PHASE_START, 0.03f);
         const char *argv[] = {
             ytdlp, "--no-playlist", "--no-warnings", "--no-colors", "--ffmpeg-location", ffmpeg,
@@ -1024,9 +1073,13 @@ static void run_job(Downloads *d, Dl_Worker *w, u64 uid) {
                 platform_mutex_lock(&d->mu);
                 Dl_Slot *s = find_slot(d, uid);
                 if (s) {
-                    dl_parse_meta_line(line, &s->j);
-                    j = s->j;
-                    d->version++;
+                    if (dl_parse_meta_line(line, &s->j)) {
+                        j = s->j;
+                        if (!save_locked(d)) {
+                            core_cstr_copy(err, sizeof(err), "Could not save download metadata");
+                            platform_process_kill(p);
+                        }
+                    }
                 }
                 platform_mutex_unlock(&d->mu);
                 if (plan_dest(&j, music_dir, dest_dir, dest, sizeof(dest))) {
@@ -1039,14 +1092,19 @@ static void run_job(Downloads *d, Dl_Worker *w, u64 uid) {
         }
         set_proc(w, 0); /* before finish(): it frees the handle other threads may still kill */
         s32 code = platform_process_finish(p);
-        if (w->cancel) { goto cancelled; }
-        if (d->quit) { job_requeue(d, uid); return; }
+        u32 stop = game_download_stop(w);
+        if (stop == 2) goto cancelled;
+        if (stop == 1) { job_requeue(d, uid); return; }
         if (skip_existing) existed = true;
         else if (code != 0) {
             job_fail(d, uid, err);
             goto cleanup_partial;
         }
     }
+
+    u32 stop = game_download_stop(w);
+    if (stop == 2) goto cancelled;
+    if (stop == 1) { job_requeue(d, uid); return; }
 
     if (existed) {
         job_done(d, uid, dest, true);
@@ -1055,7 +1113,8 @@ static void run_job(Downloads *d, Dl_Worker *w, u64 uid) {
     }
 
     /* ---- tag: audio + cover -> final file ---- */
-    if (!platform_file_info(audio).exists) {
+    Platform_FileInfo audio_info = platform_file_info(audio);
+    if (!audio_info.exists || audio_info.is_dir || !audio_info.size) {
         job_fail(d, uid, err[0] ? err : "yt-dlp produced no audio file");
         return;
     }
@@ -1071,28 +1130,59 @@ static void run_job(Downloads *d, Dl_Worker *w, u64 uid) {
         platform_remove_tree(work);
         return;
     }
+    if (strlen(dest) >= sizeof(j.path)) {
+        job_fail(d, uid, "Destination path is too long");
+        return;
+    }
+    /* Persist the exact intended final path before publishing any file. */
+    platform_mutex_lock(&d->mu);
+    slot = find_slot(d, uid);
+    b32 saved = false;
+    if (slot) {
+        core_cstr_copy(slot->j.path, sizeof(slot->j.path), dest);
+        saved = save_locked(d);
+    }
+    platform_mutex_unlock(&d->mu);
+    if (!saved) {
+        job_fail(d, uid, "Could not save download destination");
+        return;
+    }
     char dir[1600];
     core_cstr_copy(dir, sizeof(dir), dest);
     {
         char *slash = strrchr(dir, '/');
-        if (slash) { *slash = 0; platform_make_dirs(dir); }
+        if (slash) {
+            *slash = 0;
+            if (!platform_make_dirs(dir)) {
+                job_fail(d, uid, "Could not create destination folder");
+                return;
+            }
+        }
     }
     snprintf(part, sizeof(part), "%s.part", dest);
     /* the half-written file sits in the library folder: note where, so a crash can't leave it there for good */
     char marker[1200], note[1800];
     work_path(d, j.vid, "tagging", marker, sizeof(marker));
     snprintf(note, sizeof(note), "%s\n", part);
-    platform_file_write_all(marker, note, strlen(note));
-    if (!tag_file(d, &j, audio, cover, part, err, sizeof(err))) {
+    if (!platform_file_write_all(marker, note, strlen(note))) {
+        job_fail(d, uid, "Could not save tagging recovery marker");
+        return;
+    }
+    b32 tagged = tag_file(w, ffmpeg, &j, audio, cover, part, err, sizeof(err));
+    stop = game_download_stop(w);
+    if (!tagged || stop) {
         platform_file_remove(part);
+        platform_file_remove(marker);
         platform_remove_dir_if_empty(dir);
-        if (w->cancel) goto cancelled;
-        if (d->quit) { job_requeue(d, uid); return; }
+        if (stop == 2) goto cancelled;
+        if (stop == 1) { job_requeue(d, uid); return; }
         job_fail(d, uid, err);
         return;
     }
-    if (!platform_file_rename(part, dest)) {
+    Platform_FileInfo tagged_info = platform_file_info(part);
+    if (!tagged_info.exists || tagged_info.is_dir || !tagged_info.size || !platform_file_rename(part, dest)) {
         platform_file_remove(part);
+        platform_file_remove(marker);
         platform_remove_dir_if_empty(dir);
         job_fail(d, uid, "Could not save the file");
         return;
@@ -1171,7 +1261,7 @@ static u32 search_run(Downloads *d, u32 gen, const char *target, u32 limit, u32 
 
     platform_mutex_lock(&d->mu);
     d->search_proc = p;
-    if (d->sinfo.generation != gen) platform_process_kill(p);
+    if (d->quit || d->sinfo.generation != gen) platform_process_kill(p);
     platform_mutex_unlock(&d->mu);
 
     u32 added = 0;
@@ -1255,7 +1345,7 @@ static void enrich_music(Downloads *d, u32 gen) {
     }
     platform_mutex_lock(&d->mu);
     for (u32 i = 0; i < n; i++) d->enrich_procs[i] = procs[i];
-    if (d->sinfo.generation != gen) kill_enrich_locked(d);
+    if (d->quit || d->sinfo.generation != gen) kill_enrich_locked(d);
     platform_mutex_unlock(&d->mu);
 
     f64 deadline = now_s() + 45.0;
@@ -1340,7 +1430,7 @@ static void search_main(void *arg) {
                      "https://music.youtube.com/search?q=%s&sp=EgWKAQIIAWoKEAoQAxAEEAkQBQ%%3D%%3D", q);
             found = search_run(d, gen, target, 200, 100, true, true, err, sizeof(err));
             platform_mutex_lock(&d->mu);
-            b32 current = d->sinfo.generation == gen;
+            b32 current = !d->quit && d->sinfo.generation == gen;
             platform_mutex_unlock(&d->mu);
             if (!found && current) { /* the filter link may have changed: fall back to a plain search */
                 snprintf(target, sizeof(target), "ytsearch60:%s topic", query);
@@ -1355,7 +1445,7 @@ static void search_main(void *arg) {
                      "https://music.youtube.com/search?q=%s&sp=EgWKAQIIAWoKEAoQAxAEEAkQBQ%%3D%%3D", q);
             found = search_run(d, gen, target, 5, 5, false, true, err, sizeof(err));
             platform_mutex_lock(&d->mu);
-            b32 current = d->sinfo.generation == gen;
+            b32 current = !d->quit && d->sinfo.generation == gen;
             platform_mutex_unlock(&d->mu);
             /* ... then whatever else is on YouTube */
             if (current) {
@@ -1384,7 +1474,9 @@ static void sweep_work_dir(Downloads *d);
 
 Downloads *downloads_create(const char *state_path, const char *work_dir) {
     Downloads *d = core_heap_calloc(sizeof(*d));
+    if (!d) return 0;
     platform_mutex_init(&d->mu);
+    platform_mutex_init(&d->save_mu);
     platform_cond_init(&d->cv);
     core_cstr_copy(d->state_path, sizeof(d->state_path), state_path);
     core_cstr_copy(d->work_dir, sizeof(d->work_dir), work_dir);
@@ -1451,12 +1543,16 @@ void downloads_destroy(Downloads *d) {
     save_locked(d); /* jobs that were running are written as queued by the parser */
     platform_mutex_unlock(&d->mu);
     core_heap_free(d->slots);
+    platform_cond_destroy(&d->cv);
+    platform_mutex_destroy(&d->save_mu);
+    platform_mutex_destroy(&d->mu);
     core_heap_free(d);
 }
 
-void downloads_configure(Downloads *d, const char *dest_dir, u32 parallel) {
+void downloads_configure(Downloads *d, const char *dest_dir, const char *music_dir, u32 parallel) {
     platform_mutex_lock(&d->mu);
     core_cstr_copy(d->dest_dir, sizeof(d->dest_dir), dest_dir);
+    core_cstr_copy(d->music_dir, sizeof(d->music_dir), music_dir);
     d->parallel = CORE_CLAMP(parallel, 1u, (u32)DL_MAX_WORKERS);
     platform_mutex_unlock(&d->mu);
     platform_cond_broadcast(&d->cv);
@@ -1495,12 +1591,6 @@ static void sweep_work_dir(Downloads *d) {
         if (!wanted) platform_remove_tree(path);
     }
     core_arena_release(&a);
-}
-
-void downloads_set_library(Downloads *d, const char *music_dir) {
-    platform_mutex_lock(&d->mu);
-    core_cstr_copy(d->music_dir, sizeof(d->music_dir), music_dir);
-    platform_mutex_unlock(&d->mu);
 }
 
 void downloads_check_tools(Downloads *d) {
@@ -1781,12 +1871,12 @@ void downloads_remove(Downloads *d, u64 uid) {
         } else {
             b32 unfinished = s->j.state != DL_DONE;
             job_remove_locked(d, uid);
-            save_locked(d);
             if (unfinished) {
                 char work[1100];
                 work_path(d, vid, 0, work, sizeof(work));
                 platform_remove_tree(work);
             }
+            save_locked(d);
         }
     }
     platform_mutex_unlock(&d->mu);

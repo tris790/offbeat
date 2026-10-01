@@ -178,10 +178,12 @@ void             platform_thread_set_background(void);
 u32              platform_cpu_count(void);
 
 void platform_mutex_init(Platform_Mutex *m);
+void platform_mutex_destroy(Platform_Mutex *m);
 void platform_mutex_lock(Platform_Mutex *m);
 void platform_mutex_unlock(Platform_Mutex *m);
 
 void platform_cond_init(Platform_Cond *c);
+void platform_cond_destroy(Platform_Cond *c);
 void platform_cond_wait(Platform_Cond *c, Platform_Mutex *m);
 /* Returns false on timeout. */
 b32  platform_cond_wait_timeout(Platform_Cond *c, Platform_Mutex *m, f64 seconds);

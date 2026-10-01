@@ -972,7 +972,7 @@ static void draw_window_buttons(Ui *ui, Platform_Window *win, f32 right, f32 y, 
     f32 xs[3] = { right - S(110), right - S(69), right - S(29) };
     for (u32 i = 0; i < 3; i++) {
         vec2 c = vec2_make(xs[i], y);
-        Ui_Interact it = ui_interact(ui, ui_id(names[i]), vec2_make(c.x - S(17), c.y - S(15)), vec2_make(S(34), S(30)), PLATFORM_CURSOR_DEFAULT);
+        Ui_Interact it = ui_interact(ui, ui_id(names[i]), vec2_make(c.x - S(17), c.y - S(15)), vec2_make(S(34), S(30)), PLATFORM_CURSOR_HAND);
         vec4 bg = i == 2 ? UI_RGBA(232, 72, 96, 0.9f * it.hover_t * a) : UI_RGBA(255, 255, 255, 0.08f * it.hover_t * a);
         if (it.hover_t > 0.01f) core_draw_rect_rounded(r, vec2_make(c.x - S(17), c.y - S(13)), vec2_make(S(34), S(26)), S(6), bg);
         vec4 col = ui_alpha(ui_mix(UI_RGBA(200, 196, 220, 1), UI_TEXT, it.hover_t), a);

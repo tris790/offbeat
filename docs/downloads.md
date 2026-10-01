@@ -22,10 +22,13 @@ optional: it only fetches the small thumbnails shown in the result lists.
   status pill at the top left of the player keeps it visible when the page is
   closed. Click the pill to reopen the download page.
 
-Closing the page, or the app, never loses anything: the queue is saved on every
-change, a song that was mid-download goes back to *queued* and yt-dlp resumes
-its partial file. Failed songs retry twice more (5 s, 20 s) before showing as
-failed.
+The queue is saved on every change. After closing the app, a song that was
+mid-download goes back to *queued* and yt-dlp resumes its partial file, once
+the library and destination settings are ready. Completed audio and its tags
+are kept so interrupted tagging can finish without fetching the song again.
+If the final file was saved just before a crash, restarting recognizes it and
+cleans the scratch folder. Failed songs retry twice more (5 s, 20 s) before
+showing as failed.
 
 ## Where things go
 
@@ -36,6 +39,8 @@ failed.
   is made in it; else the artist goes to the *Folder for new artists* setting
   (default: `Downloads` inside the music folder, which the library lists as its
   own group). The library rescans itself after each finished song.
+  `Downloads` contains finished songs whose genre is unknown; it is not a list
+  of pending downloads, and clearing the download dock does not move them.
   The artist tag and folder use the *primary* artist ("A feat. B", "A & B"
   become "A"), the same rule as `~/Music/normalize_music_artists.py`.
 - No duplicates: the same song released twice ("Hypnotize" / "Hypnotize (2007

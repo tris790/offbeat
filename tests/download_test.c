@@ -177,7 +177,7 @@ static void test_persistence(void) {
     strcpy(a[0].title, "One More Time"); strcpy(a[0].artist, "Daft Punk"); strcpy(a[0].album, "Discovery");
     strcpy(a[0].path, "/home/me/Music/Downloads/Daft Punk/One More Time.mp3"); a[0].year = 2001; a[0].track = 1; a[0].duration_s = 321;
     a[1].uid = 8; a[1].state = DL_ACTIVE; memcpy(a[1].vid, "khnokW3Mw24", 12); strcpy(a[1].title, "Instant Crush");
-    a[1].progress = 0.5f;
+    a[1].progress = 0.5f; a[1].metadata_ready = true;
     a[2].uid = 9; a[2].state = DL_FAILED; a[2].attempts = 3; memcpy(a[2].vid, "Jb6gcoR266U", 12);
     strcpy(a[2].title, "Around the World"); strcpy(a[2].error, "Video unavailable");
 
@@ -190,8 +190,11 @@ static void test_persistence(void) {
     CHECK(cnt == 3 && next == 10);
     CHECK(b[0].uid == 7 && b[0].state == DL_DONE && b[0].year == 2001 && b[0].track == 1 && b[0].duration_s == 321);
     CHECK_STR(b[0].path, a[0].path); CHECK_STR(b[0].album, "Discovery"); CHECK(b[0].progress == 1.0f);
-    CHECK(b[1].state == DL_QUEUED && b[1].progress == 0.0f);            /* running -> queued */
+    CHECK(b[1].state == DL_QUEUED && b[1].progress == 0.0f && b[1].metadata_ready);            /* running -> queued */
     CHECK(b[2].state == DL_FAILED && b[2].attempts == 3 && !strcmp(b[2].error, "Video unavailable"));
+    /* Old queues load without claiming their search hints are full metadata. */
+    CHECK(dl_jobs_parse(core_str("offbeat-downloads 1\njob\t1\t1\t0\tabcdefghijk\t0\t0\t0\tSong\tArtist\t\t\t\t\n"), b, 8, &next) == 1);
+    CHECK(b[0].state == DL_QUEUED && !b[0].metadata_ready);
     /* truncated output never yields a half-written job */
     u32 cnt2 = dl_jobs_parse((Core_String){ .str = (u8 *)buf, .len = n - 20 }, b, 8, &next);
     CHECK(cnt2 == 2 || cnt2 == 3);
@@ -217,6 +220,7 @@ static const char *FAKE_YTDLP =
     "target=\"${args[${#args[@]}-1]}\"\n"
     "for a in \"$@\"; do [[ \"$a\" == --skip-download ]] && lookup=1; done\n"
     "if [[ -n \"$lookup\" ]]; then   # artist + real title of one YouTube Music hit\n"
+    "  [[ -f \"$FAKE_DIR/enrich_slow\" ]] && { touch \"$FAKE_DIR/enrich_started\"; sleep 30; }\n"
     "  id=\"${target##*v=}\"; n=$((10#${id#vid}))\n"
     "  title=\"Song $n (2011 Remaster)\"\n"
     "  [[ -f \"$FAKE_DIR/enrich_dup\" && $n == 3 ]] && title=\"Song 2 - Remastered 2009\"\n"
@@ -240,12 +244,15 @@ static const char *FAKE_YTDLP =
     "dir=\"$(dirname \"$out\")\"\n"
     "[[ -f \"$FAKE_DIR/fail_$id\" ]] && { echo 'WARNING: noise'; echo \"ERROR: [youtube] $id: Video unavailable\" >&2; exit 1; }\n"
     "printf 'OBM\\x1f%s\\x1f%s\\x1f%s\\x1f%s\\x1f%s\\x1f%s\\x1f%s\\x1f%s\\x1f%s\\x1f%s\\x1f%s\\n' \"Title $id\" \"Title $id\" 'Fake Artist & Guest' 'Fake Album' 2020 2021 200 NA 'Fake Artist' 4 'Fake Artist'\n"
+    "[[ -f \"$dir/$id.webm.part\" ]] && echo \"resumed:$id\" >> \"$log\"\n"
+    "echo partial-bytes > \"$dir/$id.webm.part\"\n"
     "slow=${FAKE_SLOW:-0}\n"
     "[[ -f \"$FAKE_DIR/slow\" ]] && slow=1\n"
     "for p in 100 2000 40000 500000 1000000; do echo \"OBP $p 1000000 NA\"; [[ $slow == 1 ]] && sleep 0.4 || sleep 0.02; done\n"
     "[[ $slow == 1 ]] && sleep 30\n"
     "echo audio-bytes > \"$dir/$id.mp3\"\n"
     "echo cover-bytes > \"$dir/$id.jpg\"\n"
+    "rm -f \"$dir/$id.webm.part\"\n"
     "exit 0\n";
 
 static const char *FAKE_FFMPEG =
@@ -255,6 +262,7 @@ static const char *FAKE_FFMPEG =
     "args=(\"$@\")\n"
     "out=\"${args[${#args[@]}-1]}\"\n"
     "cat \"${args[5]}\" > \"$out\"; echo \"$*\" >> \"$out\"\n"
+    "[[ -f \"$FAKE_DIR/tag_slow\" ]] && { touch \"$FAKE_DIR/tag_started\"; sleep 30; }\n"
     "exit 0\n";
 
 static void write_script(const char *path, const char *body) {
@@ -290,6 +298,7 @@ static b32 all_settled(Downloads *d, void *arg) {
 }
 static b32 has_active(Downloads *d, void *arg) { CORE_UNUSED(arg); return downloads_summary(d).active > 0; }
 static b32 done_count_is(Downloads *d, void *arg) { return downloads_summary(d).done == (u32)(uintptr_t)arg; }
+static b32 file_exists(Downloads *d, void *arg) { CORE_UNUSED(d); return platform_file_info(arg).exists; }
 
 static void test_pipeline(void) {
     const char *root = "/tmp/offbeat-dl-test";
@@ -306,7 +315,7 @@ static void test_pipeline(void) {
     snprintf(script, sizeof(script), "%s/ffmpeg", dir);   write_script(script, FAKE_FFMPEG);  setenv("OFFBEAT_FFMPEG", script, 1);
 
     Downloads *d = downloads_create(state, work);
-    downloads_configure(d, dest, 2);
+    downloads_configure(d, dest, "", 2);
     Dl_Tools tools = downloads_tools(d);
     CHECK(tools.ytdlp);
 
@@ -438,15 +447,25 @@ static void test_pipeline(void) {
     f64 t1 = platform_time_seconds();
     downloads_destroy(d);                                                 /* kills the child, joins */
     CHECK(platform_time_seconds() - t1 < 5.0);
+    char partial[512];
+    snprintf(partial, sizeof(partial), "%s/%s/%s.webm.part", work, more[0].vid, more[0].vid);
+    CHECK(platform_file_info(partial).size > 0);
 
     d = downloads_create(state, work);
-    downloads_configure(d, dest, 2);
+    platform_sleep(0.7); /* initialization can take time; no unconfigured job may start */
+    CHECK(downloads_summary(d).queued == 2 && downloads_summary(d).active == 0);
+    CHECK(platform_file_info(partial).size > 0);
+    downloads_configure(d, dest, "", 2);
     sum = downloads_summary(d);
     CHECK(sum.total == 2 && sum.queued + sum.active == 2 && sum.done == 0); /* workers may already have picked one up */
     platform_file_remove(p);                                              /* the network is fast again */
     CHECK(wait_for(d, all_settled, 0, 30));
     sum = downloads_summary(d);
     CHECK(sum.done == 2 && sum.failed == 0);
+    char resume_log[32000];
+    snprintf(p, sizeof(p), "%s/ytdlp.log", dir);
+    read_file(p, resume_log, sizeof(resume_log));
+    CHECK(strstr(resume_log, "resumed:vid00000005") != 0);
 
     /* pausing holds queued jobs back; removing a running one cancels it */
     downloads_set_paused(d, true);
@@ -523,8 +542,7 @@ static void test_library(void) {
     platform_file_write_all(stale_marker, note, strlen(note));
 
     Downloads *d = downloads_create(state, work);
-    downloads_configure(d, dest, 2);
-    downloads_set_library(d, music);
+    downloads_configure(d, dest, music, 2);
     CHECK(!platform_file_info(stale).exists);
     CHECK(!platform_file_info(half).exists);
     CHECK(platform_file_info(artist_dir).exists);                         /* the artist folder itself stays */
@@ -604,6 +622,131 @@ static void test_library(void) {
     platform_remove_tree(root);
 }
 
+
+/* Saved crash boundaries and closing during tagging both recover without a
+   second network download. Every fixture is isolated from the real library. */
+static void test_recovery(void) {
+    const char *root = "/tmp/offbeat-dl-test-recovery";
+    platform_remove_tree(root);
+    char fake[256], state[256], work[256], music[256], dest[256], artist[300], script[300];
+    snprintf(fake, sizeof(fake), "%s/fake", root);
+    snprintf(state, sizeof(state), "%s/downloads", root);
+    snprintf(work, sizeof(work), "%s/work", root);
+    snprintf(music, sizeof(music), "%s/Music", root);
+    snprintf(dest, sizeof(dest), "%s/Downloads", music);
+    snprintf(artist, sizeof(artist), "%s/Rock/Fake Artist", music);
+    platform_make_dirs(fake);
+    platform_make_dirs(artist);
+    setenv("FAKE_DIR", fake, 1);
+    snprintf(script, sizeof(script), "%s/yt-dlp", fake); write_script(script, FAKE_YTDLP); setenv("OFFBEAT_YTDLP", script, 1);
+    snprintf(script, sizeof(script), "%s/ffmpeg", fake); write_script(script, FAKE_FFMPEG); setenv("OFFBEAT_FFMPEG", script, 1);
+
+    Dl_Job jobs[3] = {0};
+    for (u32 i = 0; i < 3; i++) {
+        jobs[i].uid = i + 1;
+        jobs[i].state = DL_ACTIVE;
+        jobs[i].metadata_ready = true;
+        core_cstr_copy(jobs[i].artist, sizeof(jobs[i].artist), "Fake Artist");
+    }
+    core_cstr_copy(jobs[0].vid, sizeof(jobs[0].vid), "vidCACHE001");
+    core_cstr_copy(jobs[0].title, sizeof(jobs[0].title), "Cached");
+    snprintf(jobs[0].path, sizeof(jobs[0].path), "%s/Cached.mp3", artist);
+    core_cstr_copy(jobs[1].vid, sizeof(jobs[1].vid), "vidDONE0001");
+    core_cstr_copy(jobs[1].title, sizeof(jobs[1].title), "Published");
+    snprintf(jobs[1].path, sizeof(jobs[1].path), "%s/Published.mp3", artist);
+    CHECK(platform_file_write_all(jobs[1].path, "published", 9));
+    core_cstr_copy(jobs[2].vid, sizeof(jobs[2].vid), "vidPENDING1");
+    core_cstr_copy(jobs[2].title, sizeof(jobs[2].title), "Pending");
+    jobs[2].metadata_ready = false;
+    jobs[2].state = DL_QUEUED;
+    char cache[400], audio[450], half[1100], marker[450], buf[12000];
+    snprintf(cache, sizeof(cache), "%s/%s", work, jobs[0].vid);
+    platform_make_dirs(cache);
+    snprintf(audio, sizeof(audio), "%s/%s.mp3", cache, jobs[0].vid);
+    CHECK(platform_file_write_all(audio, "complete-audio", 14));
+    snprintf(half, sizeof(half), "%s.part", jobs[0].path);
+    CHECK(platform_file_write_all(half, "incomplete", 10));
+    snprintf(marker, sizeof(marker), "%s/tagging", cache);
+    CHECK(platform_file_write_all(marker, half, strlen(half)));
+    u64 n = dl_jobs_format(jobs, 3, 4, buf, sizeof(buf));
+    CHECK(platform_file_write_all(state, buf, n));
+
+    Downloads *d = downloads_create(state, work);
+    CHECK(!platform_file_info(half).exists && !platform_file_info(marker).exists);
+    CHECK(platform_file_info(audio).size == 14);
+    platform_sleep(0.7);
+    CHECK(downloads_summary(d).queued == 3 && downloads_summary(d).active == 0);
+    downloads_configure(d, dest, music, 2);
+    CHECK(wait_for(d, all_settled, 0, 10));
+    CHECK(downloads_summary(d).done == 3 && downloads_take_finished(d) == 3);
+    CHECK(platform_file_info(jobs[0].path).size > 0 && platform_file_info(jobs[1].path).size == 9);
+    CHECK(!platform_file_info(cache).exists);
+    char logpath[300], log[12000];
+    snprintf(logpath, sizeof(logpath), "%s/ytdlp.log", fake);
+    read_file(logpath, log, sizeof(log));
+    CHECK(!strstr(log, jobs[0].vid) && !strstr(log, jobs[1].vid) && strstr(log, jobs[2].vid));
+    char wrong[400]; snprintf(wrong, sizeof(wrong), "%s/Fake Artist", dest);
+    CHECK(!platform_file_info(wrong).exists);
+    downloads_clear_finished(d);
+
+    char slow[300], started[300];
+    snprintf(slow, sizeof(slow), "%s/tag_slow", fake);
+    snprintf(started, sizeof(started), "%s/tag_started", fake);
+    CHECK(platform_file_write_all(slow, "x", 1));
+    Dl_Result pick = {0};
+    core_cstr_copy(pick.vid, sizeof(pick.vid), "vidTAG00001");
+    core_cstr_copy(pick.title, sizeof(pick.title), "Needs tagging");
+    CHECK(downloads_enqueue(d, &pick, 1, "Fake Artist") == 1);
+    CHECK(wait_for(d, file_exists, started, 10));
+    Dl_Job j;
+    CHECK(downloads_job(d, 0, &j) && j.metadata_ready && j.state == DL_ACTIVE);
+    snprintf(half, sizeof(half), "%s.part", j.path);
+    CHECK(platform_file_info(half).size > 0);
+    f64 begin = platform_time_seconds();
+    downloads_destroy(d);
+    CHECK(platform_time_seconds() - begin < 5.0);
+    CHECK(!platform_file_info(half).exists && !platform_file_info(j.path).exists);
+    snprintf(audio, sizeof(audio), "%s/%s/%s.mp3", work, pick.vid, pick.vid);
+    CHECK(platform_file_info(audio).size > 0);
+    read_file(logpath, log, sizeof(log));
+    u64 log_size = strlen(log);
+    platform_file_remove(slow);
+    d = downloads_create(state, work);
+    downloads_configure(d, dest, music, 2);
+    CHECK(wait_for(d, all_settled, 0, 10));
+    CHECK(downloads_summary(d).done == 1 && downloads_summary(d).failed == 0);
+    read_file(logpath, log, sizeof(log));
+    CHECK(strlen(log) == log_size); /* tagging resumed offline */
+    CHECK(platform_file_info(j.path).size > 0 && !platform_file_info(half).exists);
+    snprintf(cache, sizeof(cache), "%s/%s", work, pick.vid);
+    CHECK(!platform_file_info(cache).exists);
+
+    /* Removing an active tagger stops it and clears both scratch and .part. */
+    CHECK(platform_file_write_all(slow, "x", 1));
+    platform_file_remove(started);
+    core_cstr_copy(pick.vid, sizeof(pick.vid), "vidTAG00002");
+    core_cstr_copy(pick.title, sizeof(pick.title), "Cancel tagging");
+    CHECK(downloads_enqueue(d, &pick, 1, "Fake Artist") == 1);
+    CHECK(wait_for(d, file_exists, started, 10));
+    CHECK(downloads_job(d, 1, &j) && j.state == DL_ACTIVE);
+    snprintf(half, sizeof(half), "%s.part", j.path);
+    downloads_remove(d, j.uid);
+    CHECK(wait_for(d, all_settled, 0, 5));
+    CHECK(downloads_summary(d).total == 1 && !platform_file_info(j.path).exists && !platform_file_info(half).exists);
+    snprintf(cache, sizeof(cache), "%s/%s", work, pick.vid);
+    CHECK(!platform_file_info(cache).exists);
+    /* Shutdown also reaches metadata children published after search starts. */
+    snprintf(slow, sizeof(slow), "%s/enrich_slow", fake);
+    snprintf(started, sizeof(started), "%s/enrich_started", fake);
+    CHECK(platform_file_write_all(slow, "x", 1));
+    downloads_search(d, DL_QUERY_SONG, "close during lookup");
+    CHECK(wait_for(d, file_exists, started, 10));
+    begin = platform_time_seconds();
+    downloads_destroy(d);
+    CHECK(platform_time_seconds() - begin < 5.0);
+    platform_remove_tree(root);
+}
+
 int main(void) {
     test_text();
     test_parsers();
@@ -611,6 +754,7 @@ int main(void) {
     test_persistence();
     test_pipeline();
     test_library();
+    test_recovery();
     if (g_fail) { printf("download_test: %d failure(s)\n", g_fail); return 1; }
     u64 heap = core_mem_stats().heap_live;
     printf("download_test: ok (heap after: %llu bytes)\n", (unsigned long long)heap);

@@ -11,6 +11,7 @@
 #include <poll.h>
 #include <signal.h>
 #include <spawn.h>
+#include <stdatomic.h>
 #include <pthread.h>
 #include <sched.h>
 #include <stdio.h>
@@ -94,6 +95,7 @@ u32 platform_cpu_count(void) {
 }
 
 void platform_mutex_init(Platform_Mutex *m)   { pthread_mutex_init((pthread_mutex_t *)m->opaque, 0); }
+void platform_mutex_destroy(Platform_Mutex *m) { pthread_mutex_destroy((pthread_mutex_t *)m->opaque); }
 void platform_mutex_lock(Platform_Mutex *m)   { pthread_mutex_lock((pthread_mutex_t *)m->opaque); }
 void platform_mutex_unlock(Platform_Mutex *m) { pthread_mutex_unlock((pthread_mutex_t *)m->opaque); }
 
@@ -121,6 +123,7 @@ b32 platform_cond_wait_timeout(Platform_Cond *c, Platform_Mutex *m, f64 seconds)
 }
 
 void platform_cond_signal(Platform_Cond *c)    { pthread_cond_signal((pthread_cond_t *)c->opaque); }
+void platform_cond_destroy(Platform_Cond *c) { pthread_cond_destroy((pthread_cond_t *)c->opaque); }
 void platform_cond_broadcast(Platform_Cond *c) { pthread_cond_broadcast((pthread_cond_t *)c->opaque); }
 
 /* ---- files ---- */
@@ -169,16 +172,18 @@ Core_String platform_file_read_all(Core_Arena *arena, const char *path) {
 
 b32 platform_file_write_all(const char *path, const void *data, u64 size) {
     char tmp[4096];
-    snprintf(tmp, sizeof(tmp), "%s.tmp.%d", path, (int)getpid());
-    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    int len = snprintf(tmp, sizeof(tmp), "%s.tmp.XXXXXX", path);
+    if (len < 0 || (u64)len >= sizeof(tmp)) return false;
+    int fd = mkostemp(tmp, O_CLOEXEC);
     if (fd < 0) return false;
+    if (fchmod(fd, 0644) != 0) { close(fd); unlink(tmp); return false; }
     u64 done = 0;
     while (done < size) {
         ssize_t n = write(fd, (const u8 *)data + done, size - done);
-        if (n < 0) { if (errno == EINTR) continue; close(fd); unlink(tmp); return false; }
+        if (n <= 0) { if (n < 0 && errno == EINTR) continue; close(fd); unlink(tmp); return false; }
         done += (u64)n;
     }
-    close(fd);
+    if (close(fd) != 0) { unlink(tmp); return false; }
     if (rename(tmp, path) != 0) { unlink(tmp); return false; }
     return true;
 }
@@ -389,7 +394,7 @@ struct Platform_Process {
     pid_t pid;
     int   fd;          /* read end of the merged stdout/stderr pipe */
     b32   eof;
-    f64   killed_at;   /* when platform_process_kill asked it to stop (0 = never) */
+    _Atomic s64 killed_at_ns; /* shared cancellation deadline, 0 = never */
     u32   len;         /* bytes buffered in `buf` */
     char  buf[4096];
 };
@@ -442,7 +447,11 @@ s32 platform_process_read_line(Platform_Process *p, char *buf, u32 cap, f64 time
 
         f64 now = platform_time_seconds();
         /* asked to stop but still talking: stop asking nicely */
-        if (p->killed_at > 0 && now - p->killed_at > 2.0) { kill(-p->pid, SIGKILL); p->killed_at = now + 1e9; }
+        s64 killed = atomic_load(&p->killed_at_ns);
+        if (killed > 0 && now - (f64)killed / 1e9 > 2.0) {
+            kill(-p->pid, SIGKILL);
+            atomic_store(&p->killed_at_ns, (s64)((now + 1e9) * 1e9));
+        }
         f64 left = deadline - now;
         if (left < 0) left = 0;
         struct pollfd pfd = { .fd = p->fd, .events = POLLIN };
@@ -458,7 +467,8 @@ s32 platform_process_read_line(Platform_Process *p, char *buf, u32 cap, f64 time
 void platform_process_kill(Platform_Process *p) {
     if (!p || p->pid <= 0) return;
     kill(-p->pid, SIGTERM);
-    if (p->killed_at == 0) p->killed_at = platform_time_seconds();
+    s64 expected = 0;
+    atomic_compare_exchange_strong(&p->killed_at_ns, &expected, (s64)(platform_time_seconds() * 1e9));
 }
 
 s32 platform_process_finish(Platform_Process *p) {

@@ -52,6 +52,7 @@ typedef struct {
     u8   phase;                 /* Dl_Phase, while ACTIVE                    */
     u8   attempts;              /* failed attempts so far                    */
     u8   existed;               /* DONE because the file was already there   */
+    u8   metadata_ready;        /* persisted tags allow offline finalization */
     f32  progress;              /* 0..1 over fetch + convert + tag           */
     char error[DL_TEXT];        /* last failure                              */
     char path[1024];            /* final file, once DONE                     */
@@ -102,16 +103,16 @@ typedef struct Downloads Downloads;
 
 /* `state_path`: where the queue is persisted. `work_dir`: scratch space for
    in-flight downloads (kept across runs so partial files can resume). Loads
-   the saved queue and starts the threads. */
+   the saved queue and starts the threads. Jobs wait for configure(). */
 Downloads *downloads_create(const char *state_path, const char *work_dir);
 /* Stops running downloads (they resume next time), saves, joins, frees. */
 void       downloads_destroy(Downloads *d);
 
 /* Where songs of artists the library doesn't have yet go (created on demand)
    and how many download at once. */
-void       downloads_configure(Downloads *d, const char *dest_dir, u32 parallel);
-/* The library's root: finished songs are filed into its artist folders. */
-void       downloads_set_library(Downloads *d, const char *music_dir);
+/* Set the library root and fallback together before any restored job starts.
+   An empty library root is allowed; an empty destination holds the queue. */
+void       downloads_configure(Downloads *d, const char *dest_dir, const char *music_dir, u32 parallel);
 
 /* Look for yt-dlp and ffmpeg again (after the user installed them). */
 void       downloads_check_tools(Downloads *d);
