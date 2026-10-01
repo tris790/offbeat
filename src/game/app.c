@@ -18,6 +18,7 @@
 #include "covers.h"
 #include "download.h"
 #include "download_view.h"
+#include "filter.h"
 #include "library.h"
 #include "player.h"
 #include "search.h"
@@ -51,6 +52,14 @@ typedef struct {
     b32 dragging;
     f32 drag_off;
 } Scroll;
+
+typedef struct {
+    u8 query[256];
+    u32 len, caret;
+    b32 open, select_all;
+    f64 edited_at;
+    const u32 *source; /* detail filters reset when opening a different group */
+} Panel_Filter;
 
 struct App {
     Core_Arena *arena;
@@ -117,6 +126,11 @@ struct App {
     s32    genre_open;         /* -1 = genre list */
     Scroll scroll[TAB_COUNT + 2]; /* per tab, then the opened artist / genre */
     b32    queue_follow;       /* scroll queue to the current track */
+    Panel_Filter filters[TAB_COUNT + 2];
+    s32 filter_focus, filter_cached_scope;
+    const u32 *filter_cached_source;
+    u32 filter_cached_total, filter_count, filter_capacity;
+    u32 *filter_indices;       /* one reusable visible-view index, four bytes per item */
 
     /* palette */
     b32  search_open;
@@ -518,6 +532,10 @@ static void adopt_library(App *app, Library *nl) {
         app->cur = new_cur >= 0 ? new_cur : (w ? 0 : -1);
     }
     app->lib = nl;
+    app->filter_cached_scope = -1;
+    app->filter_focus = -1;
+    app->filters[TAB_COUNT] = (Panel_Filter){0};
+    app->filters[TAB_COUNT + 1] = (Panel_Filter){0};
     if (app->artist_open >= (s32)nl->artist_count) app->artist_open = -1;
     if (app->genre_open >= (s32)nl->genre_count) app->genre_open = -1;
     if (old) {
@@ -762,6 +780,7 @@ App *app_create(Core_Arena *arena, Core_Renderer *r, Platform_Window *win) {
     app->cur = -1;
     app->artist_open = -1;
     app->genre_open = -1;
+    app->filter_focus = app->filter_cached_scope = -1;
     app->repeat = REPEAT_OFF;
     app->demo = platform_env("OFFBEAT_DEMO");
 
@@ -836,6 +855,7 @@ void app_shutdown(App *app) {
     if (app->scanner) library_scanner_destroy(app->scanner);
     player_destroy(app->player);
     covers_destroy(app->covers);
+    core_heap_free(app->filter_indices);
 }
 
 /* ------------------------------------------------------------------------- */
