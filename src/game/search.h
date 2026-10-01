@@ -42,7 +42,4 @@ typedef struct {
 /* Returns the number of hits written to `out` (sorted by score, best first). */
 u32 search_tracks(const Library *lib, Core_String query, Search_Hit *out, u32 max_results);
 
-/* Fold Latin text to lowercase ASCII-ish bytes; 0xFF = preserve codepoint. */
-u8 search_fold(u32 cp);
-
 #endif /* GAME_SEARCH_H */

@@ -2,11 +2,11 @@
 #
 # Offbeat build.
 #
-#   ./build.sh            debug build (tcc, -g)            -> build/offbeat
-#   ./build.sh release    optimized build (gcc -O2)        -> build/offbeat
-#   ./build.sh asan       debug + address/UB sanitizers (gcc)
-#   ./build.sh test       unit tests (tcc)
-#   ./build.sh testasan   unit tests under address/UB sanitizers (gcc)
+#   ./build.sh [debug]    debug build (tcc, -g) -> build/offbeat
+#   ./build.sh test       build and run unit tests with address/UB sanitizers (gcc)
+#
+# Usage: ./build.sh [debug | test]; defaults to debug.
+# Keep this interface limited to debug and test; do not add extra flags or commands.
 #
 # App code (everything under src/ except third_party/) is compiled in a single
 # cc invocation, so new .c files are picked up automatically. Heavy third-party
@@ -26,7 +26,23 @@ GEN="$BUILD/gen"
 OBJ="$BUILD/obj"
 OUT="$BUILD/offbeat"
 
-MODE="${1:-debug}"
+if (( $# > 1 )); then
+    echo "Usage: ./build.sh [debug | test]" >&2
+    exit 2
+fi
+MODE="${1-debug}"
+case "$MODE" in
+    debug|test) ;;
+    -h|--help)
+        echo "Usage: ./build.sh [debug | test]"
+        echo "Default: debug (tcc). Tests always use address/UB sanitizers (gcc)."
+        exit 0
+        ;;
+    *)
+        echo "unknown mode '$MODE' (use: debug | test)" >&2
+        exit 2
+        ;;
+esac
 
 mkdir -p "$BUILD" "$GEN" "$OBJ"
 
@@ -81,38 +97,36 @@ STD="-std=c2x -D_GNU_SOURCE"
 
 case "$MODE" in
     debug)   CC="${CC:-tcc}"; OPT="-g" ;;
-    release) CC="${CC:-gcc}"; OPT="-O2 -DNDEBUG" ;;
-    asan)    CC="${CC:-gcc}"; OPT="-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer" ;;
-    test)    CC="${CC:-tcc}"; OPT="-g" ;;
-    testasan) CC="${CC:-gcc}"; OPT="-O1 -g -w -fsanitize=address,undefined -fno-omit-frame-pointer" ;;
-    *) echo "unknown mode '$MODE' (use: debug | release | asan | test | testasan)" >&2; exit 2 ;;
+    test)    CC="${CC:-gcc}"; OPT="-O1 -g -w -fsanitize=address,undefined -fno-omit-frame-pointer" ;;
 esac
 
-if [[ "$MODE" == test || "$MODE" == testasan ]]; then
+if [[ "$MODE" == test ]]; then
     # Each tests/*.c is a standalone program that may #include app sources.
     for t in "$ROOT"/tests/*.c; do
         exe="$BUILD/test_$(basename "$t" .c)"
         # shellcheck disable=SC2086
-        "$CC" $STD $OPT -I"$SRC" "$t" "$OBJ"/tp_*.o -o "$exe" -lm -lpthread $(pkg-config --libs alsa)
+        "$CC" $STD $OPT -I"$SRC" "$t" "$SRC/platform/platform_memory_posix.c" "$OBJ"/tp_*.o -o "$exe" -lm -lpthread $(pkg-config --libs alsa)
         "$exe"
     done
-    exit 0
+    RESULT="passed unit tests with ASan/UBSan"
+else
+
+    DEPS="wayland-client wayland-cursor wayland-egl egl gl xkbcommon alsa"
+    PKG_CFLAGS="$(pkg-config --cflags $DEPS)"
+    PKG_LIBS="$(pkg-config --libs $DEPS)"
+
+    mapfile -t SOURCES < <(find "$SRC" -name '*.c' -not -path '*/third_party/*' | sort)
+
+    # shellcheck disable=SC2086
+    "$CC" $STD $WARN $OPT \
+        -I"$GEN" -I"$SRC" \
+        $PKG_CFLAGS \
+        "${SOURCES[@]}" "${CACHED_OBJS[@]}" \
+        -o "$OUT" \
+        $PKG_LIBS -lm -lpthread
+    RESULT="built $OUT"
 fi
-
-DEPS="wayland-client wayland-cursor wayland-egl egl gl xkbcommon alsa"
-PKG_CFLAGS="$(pkg-config --cflags $DEPS)"
-PKG_LIBS="$(pkg-config --libs $DEPS)"
-
-mapfile -t SOURCES < <(find "$SRC" -name '*.c' -not -path '*/third_party/*' | sort)
-
-# shellcheck disable=SC2086
-"$CC" $STD $WARN $OPT \
-    -I"$GEN" -I"$SRC" \
-    $PKG_CFLAGS \
-    "${SOURCES[@]}" "${CACHED_OBJS[@]}" \
-    -o "$OUT" \
-    $PKG_LIBS -lm -lpthread
 
 end=$(date +%s%N)
 ms=$(( (end - start) / 1000000 ))
-printf 'built %s (%s) in %d.%03ds\n' "$OUT" "$MODE" "$((ms / 1000))" "$((ms % 1000))"
+printf '%s (%s) in %d.%03ds\n' "$RESULT" "$MODE" "$((ms / 1000))" "$((ms % 1000))"

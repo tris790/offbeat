@@ -23,12 +23,17 @@ typedef struct Core_Arena {
 b32  core_arena_init(Core_Arena *arena, u64 reserve_size);
 void core_arena_release(Core_Arena *arena);
 
-/* Bump-allocate `size` bytes aligned to `align`. Zeroed. Returns 0 if OOM. */
+/* Bump-allocate `size` bytes aligned to a power of two (0 means 1). Zeroed.
+   Returns 0 on invalid alignment, overflow or OOM; failure keeps used intact. */
 void *core_arena_push(Core_Arena *arena, u64 size, u64 align);
 
 /* Convenience typed helpers. */
 #define core_push_struct(arena, T)      ((T *)core_arena_push((arena), sizeof(T), _Alignof(T)))
-#define core_push_array(arena, T, n)    ((T *)core_arena_push((arena), sizeof(T) * (u64)(n), _Alignof(T)))
+CORE_INLINE void *core_arena_push_array(Core_Arena *arena, u64 item_size, u64 count, u64 align) {
+    if (item_size && count > UINT64_MAX / item_size) return 0;
+    return core_arena_push(arena, item_size * count, align);
+}
+#define core_push_array(arena, T, n)    ((T *)core_arena_push_array((arena), sizeof(T), (u64)(n), _Alignof(T)))
 
 /* Save / restore the arena position to free everything pushed after the mark. */
 typedef struct { Core_Arena *arena; u64 used; } Core_Temp;

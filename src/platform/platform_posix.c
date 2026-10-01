@@ -61,25 +61,25 @@ static void *thread_trampoline(void *arg) {
 }
 
 Platform_Thread *platform_thread_start(Platform_ThreadProc proc, void *user, const char *name) {
-    Platform_Thread *t = calloc(1, sizeof(*t));
+    Platform_Thread *t = core_heap_calloc(sizeof(*t));
     if (!t) return 0;
     t->proc = proc;
     t->user = user;
-    if (name) snprintf(t->name, sizeof(t->name), "%s", name);
+    if (name) core_cstr_copy(t->name, sizeof(t->name), name);
 
     pthread_attr_t attr;
     pthread_attr_init(&attr);
     pthread_attr_setstacksize(&attr, 512 * 1024); /* keep RSS small */
     int rc = pthread_create(&t->handle, &attr, thread_trampoline, t);
     pthread_attr_destroy(&attr);
-    if (rc != 0) { free(t); return 0; }
+    if (rc != 0) { core_heap_free(t); return 0; }
     return t;
 }
 
 void platform_thread_join(Platform_Thread *t) {
     if (!t) return;
     pthread_join(t->handle, 0);
-    free(t);
+    core_heap_free(t);
 }
 
 void platform_thread_set_background(void) {
@@ -196,7 +196,7 @@ Platform_FileInfo platform_file_info(const char *path) {
 
 b32 platform_make_dirs(const char *path) {
     char buf[4096];
-    snprintf(buf, sizeof(buf), "%s", path);
+    core_cstr_copy(buf, sizeof(buf), path);
     for (char *p = buf + 1; *p; p++) {
         if (*p == '/') {
             *p = 0;
@@ -266,16 +266,14 @@ static b32 walk_rec(char *path, size_t len, u32 depth, Platform_WalkProc visit, 
 
 void platform_walk_dir(const char *root, Platform_WalkProc visit, void *user) {
     char path[4096];
-    snprintf(path, sizeof(path), "%s", root);
+    core_cstr_copy(path, sizeof(path), root);
     size_t len = strlen(path);
     while (len > 1 && path[len - 1] == '/') path[--len] = 0;
     walk_rec(path, len, 0, visit, user);
 }
 
-static const char *push_cstr(Core_Arena *arena, const char *s);
-
 static int cmp_name_ci(const void *a, const void *b) {
-    return strcasecmp(*(const char *const *)a, *(const char *const *)b);
+    return core_str_cmp_ascii_ci(core_str(*(const char *const *)a), core_str(*(const char *const *)b));
 }
 
 u32 platform_list_dirs(Core_Arena *arena, const char *path, const char ***out_names) {
@@ -298,7 +296,9 @@ u32 platform_list_dirs(Core_Arena *arena, const char *path, const char ***out_na
             names = n;
             cap = ncap;
         }
-        names[count++] = push_cstr(arena, e->d_name);
+        const char *name = core_str_to_cstr(arena, core_str(e->d_name));
+        if (!name) break;
+        names[count++] = name;
     }
     closedir(dir);
     if (count) qsort(names, count, sizeof(*names), cmp_name_ci);
@@ -321,21 +321,18 @@ const u8 *platform_file_map(const char *path, u64 *out_size) {
 
 /* ---- well-known paths ---- */
 
-static const char *push_cstr(Core_Arena *arena, const char *s) {
-    size_t n = strlen(s);
-    char *out = core_arena_push(arena, n + 1, 1);
-    memcpy(out, s, n + 1);
-    return out;
-}
-
 const char *platform_env(const char *name) {
     const char *v = getenv(name);
     return (v && v[0]) ? v : 0;
 }
 
+b32 platform_env_set(const char *name, const char *value, b32 overwrite) {
+    return setenv(name, value, overwrite != 0) == 0;
+}
+
 const char *platform_home_dir(Core_Arena *arena) {
     const char *h = platform_env("HOME");
-    return push_cstr(arena, h ? h : "/tmp");
+    return core_str_to_cstr(arena, core_str(h ? h : "/tmp"));
 }
 
 static const char *xdg_dir(Core_Arena *arena, const char *env, const char *fallback) {
@@ -346,7 +343,7 @@ static const char *xdg_dir(Core_Arena *arena, const char *env, const char *fallb
         const char *h = platform_env("HOME");
         snprintf(buf, sizeof(buf), "%s/%s/offbeat", h ? h : "/tmp", fallback);
     }
-    return push_cstr(arena, buf);
+    return core_str_to_cstr(arena, core_str(buf));
 }
 
 const char *platform_cache_dir(Core_Arena *arena)  { return xdg_dir(arena, "XDG_CACHE_HOME", ".cache"); }
@@ -356,17 +353,17 @@ const char *platform_music_dir(Core_Arena *arena) {
     const char *h = platform_env("HOME");
     char buf[4096];
     snprintf(buf, sizeof(buf), "%s/Music", h ? h : "/tmp");
-    return push_cstr(arena, buf);
+    return core_str_to_cstr(arena, core_str(buf));
 }
 
 const char *platform_exe_dir(Core_Arena *arena) {
     char buf[4096];
     ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
-    if (n <= 0) return push_cstr(arena, ".");
+    if (n <= 0) return core_str_to_cstr(arena, core_str("."));
     buf[n] = 0;
     char *slash = strrchr(buf, '/');
     if (slash) *slash = 0;
-    return push_cstr(arena, buf);
+    return core_str_to_cstr(arena, core_str(buf));
 }
 
 Platform_MemInfo platform_mem_info(void) {
@@ -418,7 +415,7 @@ Platform_Process *platform_process_spawn(const char *const *argv) {
     close(fds[1]);
     if (rc != 0) { close(fds[0]); return 0; }
 
-    Platform_Process *p = calloc(1, sizeof(*p));
+    Platform_Process *p = core_heap_calloc(sizeof(*p));
     if (!p) { kill(pid, SIGKILL); waitpid(pid, 0, 0); close(fds[0]); return 0; }
     p->pid = pid;
     p->fd = fds[0];
@@ -470,7 +467,7 @@ s32 platform_process_finish(Platform_Process *p) {
     int status = 0;
     while (waitpid(p->pid, &status, 0) < 0 && errno == EINTR) {}
     s32 code = WIFEXITED(status) ? WEXITSTATUS(status) : WIFSIGNALED(status) ? 128 + WTERMSIG(status) : -1;
-    free(p);
+    core_heap_free(p);
     return code;
 }
 

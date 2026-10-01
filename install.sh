@@ -11,7 +11,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 ROOT="$PWD"
-./build.sh release
+./build.sh debug
 
 PREFIX="${PREFIX:-$HOME/.local}"
 mkdir -p "$PREFIX/bin" "$PREFIX/share/applications" "$PREFIX/share/icons"

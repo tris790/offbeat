@@ -431,11 +431,8 @@ CORE_INLINE void setc(f32 *dst, vec4 c) { set4(dst, c.r, c.g, c.b, c.a); }
 /* Shape/text color through the active color matrix (images are exempt). */
 static void setcol(Core_Renderer *r, f32 *dst, vec4 c) {
     if (r->cm_on) {
-        const f32 *m = r->cm;
-        f32 x = m[0] * c.r + m[1] * c.g + m[2] * c.b;
-        f32 y = m[3] * c.r + m[4] * c.g + m[5] * c.b;
-        f32 z = m[6] * c.r + m[7] * c.g + m[8] * c.b;
-        c.r = CORE_CLAMP(x, 0.0f, 1.0f); c.g = CORE_CLAMP(y, 0.0f, 1.0f); c.b = CORE_CLAMP(z, 0.0f, 1.0f);
+        vec3 rgb = core_color_matrix_apply(r->cm, vec3_make(c.r, c.g, c.b));
+        c.r = rgb.r; c.g = rgb.g; c.b = rgb.b;
     }
     setc(dst, c);
 }

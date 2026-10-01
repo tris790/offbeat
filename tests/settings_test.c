@@ -48,6 +48,15 @@ int main(void) {
     settings_parse(&t, core_str("theme rose"));   /* no trailing newline */
     CHECK(strcmp(SETTINGS_THEMES[t.theme].id, "rose") == 0);
 
+    /* Path fields use complete UTF-8 codepoints at the fixed buffer limit. */
+    char long_line[1300];
+    memcpy(long_line, "music_dir ", 10);
+    memset(long_line + 10, 'a', 1022);
+    memcpy(long_line + 1032, "é/end", 7);
+    settings_parse(&t, core_str(long_line));
+    CHECK(strlen(t.music_dir) == 1022);
+    CHECK(core_utf8_valid(core_str(t.music_dir)));
+
     /* themes: identity for the design, grays are fixed points for all */
     f32 m[9];
     CHECK(!settings_theme_matrix(0, m));

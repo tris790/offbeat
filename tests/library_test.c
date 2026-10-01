@@ -12,6 +12,7 @@
  */
 
 #include "core/memory.c"
+#include "core/image.c"
 #include "core/string.c"
 #include "platform/platform_posix.c"
 #include "game/library.c"
@@ -391,11 +392,11 @@ static Library *test_real_library(const char *music, const char *cache) {
 
     /* Sorted order sanity + artist grouping. */
     for (u32 i = 1; i < lib->track_count; i++)
-        CHECK(lib_cmp_ci(lib->tracks[lib->by_title[i - 1]].title, lib->tracks[lib->by_title[i]].title) <= 0);
+        CHECK(core_str_cmp_ascii_ci(lib->tracks[lib->by_title[i - 1]].title, lib->tracks[lib->by_title[i]].title) <= 0);
     u32 sum = 0;
     for (u32 i = 0; i < lib->artist_count; i++) {
         sum += lib->artists[i].track_count;
-        if (i) CHECK(lib_cmp_ci(lib->artists[i - 1].name, lib->artists[i].name) < 0);
+        if (i) CHECK(core_str_cmp_ascii_ci(lib->artists[i - 1].name, lib->artists[i].name) < 0);
     }
     CHECK(sum == lib->track_count);
 
@@ -404,7 +405,7 @@ static Library *test_real_library(const char *music, const char *cache) {
     for (u32 i = 0; i < lib->genre_count; i++) {
         const Lib_Genre *g = &lib->genres[i];
         sum += g->track_count;
-        if (i) CHECK(lib_cmp_ci(lib->genres[i - 1].name, g->name) < 0);
+        if (i) CHECK(core_str_cmp_ascii_ci(lib->genres[i - 1].name, g->name) < 0);
         for (u32 k = 0; k < g->track_count; k++) {
             const Lib_Track *t = &lib->tracks[g->tracks[k]];
             CHECK(t->genre_index == i);

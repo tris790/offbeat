@@ -1,35 +1,47 @@
 # Offbeat
 
-C23 music player (Linux/Wayland/OpenGL first). Guidance for agents working in this repo.
+C23 music player (Linux/Wayland/OpenGL first).
 
 ## Goals
-- simple performant OpenGL 4.6 rendering, behind an abstracted renderer interface so the backend can change later; self contained
-- simple performant utf8 strings in C
-- simple and performant SDF font drawing
-- simple and performant shapes (rectangle, triangle, circle) and images
-- simple and performant memory allocator with virtual memory support
-- simple and performant input handling (keyboard, clicking, mouse movement, scroll wheel)
+- Simple, performant, self-contained OpenGL 4.6 behind a replaceable renderer interface.
+- Simple, performant UTF-8 strings, SDF fonts, shapes/images, VM allocation and input.
 
-## Project structure
-Each function in `src/<layer>/` is prefixed with its layer name: `core_`, `platform_`, `game_`.
-- `src/core` -> code reusable on other projects (string, allocators, renderer, etc)
-- `src/game` -> code specific to this application, works across all platforms
-- `src/platform` -> ALL OS specific code goes here (linux wayland/alsa; windows unimplemented)
-- `src/third_party` -> stb-style single header libraries
-- `src/main.c` -> very simple file that only calls the different layers
-- `tests/*.c` -> unit tests
-- `tools/` -> demo recording scripts
+## Structure
+Every new function in `src/<layer>/`, including static helpers, uses its layer prefix: `core_`, `platform_`, `game_`; avoid unrelated legacy renames.
+- `src/core` -> reusable mechanisms; `src/game` -> portable Offbeat policy.
+- `src/platform` -> ALL OS code, including VM, environment, file/tool/font discovery and native synchronization.
+- `src/third_party` -> stb-style libraries; `src/main.c` -> thin layer wiring/frame loop.
+- `tests/` -> unit tests; `tools/` -> development tools.
+Keep backend-specific handles/shaders inside renderer backends where possible; do not spread GL assumptions into game APIs.
 
-## Build
-- `./build.sh` debug (tcc), `./build.sh release` (gcc -O2), `./build.sh asan`, `./build.sh test`
-- Must stay sub 1 sec even at 100k lines of code, and must not need editing when code is added (new `.c` files are picked up automatically).
+## Reuse first
+- Before adding a helper, search core and existing callers. Use `python3 tools/list_functions.py` (JSON, layer filters and prefix checks available).
+- Use existing core string, memory, math, hash, RNG and image APIs. Extend a missing contract instead of adding a local near-copy.
+- If an app implementation is better, promote it to core and migrate duplicates. Preserve caller semantics, persistent hashes/cache keys and RNG sequences; measure performance claims.
+- Keep domain policy and distinct access/ownership contracts local; do not force specialized readers, caches or queues into one generic abstraction.
+- Use `Core_String` views for immutable text. Keep bounded mutable C strings for editing, worker ownership and external APIs; bridge with core helpers.
+- Use core copying/formatting/comparison and UTF-8 boundaries; avoid byte-cut truncation and pure `snprintf(..., "%s", ...)` copies. NUL termination, capacity, malformed input and OOM must be explicit.
 
-## Constraints
-- Memory budget "<30MB" is app-owned memory only (arenas, index, thumbnails, audio buffers), excluding the fixed GL driver cost.
-- No heavy dependencies (ffmpeg, SDL, ...) without asking.
+## Ownership and correctness
+- Use tracked core allocation for app-owned buffers/objects, including platform objects. Check size arithmetic, alignment, allocations and growth before publishing new state; preserve the old allocation on realloc failure.
+- Pair creation with complete teardown and partial-init cleanup: heap/arenas, file maps, threads, sync primitives, GPU resources and effects. Destroy GPU resources before their context.
+- Bound file bytes and decoded dimensions/pixels before decoding. Account for overlapping snapshots, scratch, queued results and concurrent decodes, not just steady state.
+- Shared mutable state needs the same lock on every access or an explicit atomic ownership protocol. Atomic indices alone do not make concurrently overwritten ring-buffer payloads safe.
+- Keep blocking disk/process work outside UI/audio paths and long-held locks. File replacement must handle concurrent writers inside platform, not rely on caller-specific locks.
+- Propagate shader/link, I/O, thread-start and initialization failures; do not return nominally valid handles after failure.
+- Existing issues and further extraction candidates: `docs/architecture-audit.md`. Do not copy a known limitation into new code.
 
-## Verifying visuals
-Use headless screenshots rather than a live window (this implies mute; the /tmp dirs keep the user's real cache/state untouched):
+## Build and constraints
+- `./build.sh [debug | test]`; defaults to `debug` (tcc). `./build.sh test` builds and runs unit tests with AddressSanitizer and UndefinedBehaviorSanitizer (gcc).
+- Must stay sub 1 sec even at 100k lines, with new `.c` files picked up automatically; report actual build mode/timing.
+- App-owned memory budget: <30 MB, excluding fixed GL driver cost. Tracked payload/arena counters alone do not prove total ownership or residency; include untracked overhead when evaluating the budget.
+- No heavy dependencies (ffmpeg, SDL, ...) without asking the user.
+- Run meaningful affected tests and normal builds; use sanitizers for memory/concurrency changes. Cached vendor objects may be uninstrumented; sanitizer success is not proof of race freedom.
+
+## Visual verification
+Use headless screenshots (mute) with isolated cache/config, rather than a live window:
 
     OFFBEAT_CACHE_DIR=/tmp/offbeat-cache OFFBEAT_CONFIG_DIR=/tmp/offbeat-config \
     OFFBEAT_SHOT=/tmp/x.png OFFBEAT_DEMO="find=bored;seek=60;tab=1;debug" ./build/offbeat
+
+Inspect the result; asynchronous loading can differ between captures. Do not disable leak checks and then claim leak-free lifecycle.

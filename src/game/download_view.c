@@ -88,21 +88,6 @@ struct Dl_View {
 /* helpers                                                                   */
 /* ------------------------------------------------------------------------- */
 
-static f32 clamp01(f32 x) { return x < 0 ? 0 : (x > 1 ? 1 : x); }
-static f32 ease_out_cubic(f32 t) { t = clamp01(t); f32 u = 1 - t; return 1 - u * u * u; }
-
-static void copy_str(char *dst, u32 cap, const char *src) {
-    snprintf(dst, cap, "%s", src);
-}
-
-static vec4 hash_color(u64 h, f32 a) {
-    f32 hue = (f32)(h % 360) / 360.0f;
-    f32 r = 0.5f + 0.5f * cosf(CORE_TAU * (hue + 0.0f));
-    f32 g = 0.5f + 0.5f * cosf(CORE_TAU * (hue + 0.33f));
-    f32 b = 0.5f + 0.5f * cosf(CORE_TAU * (hue + 0.67f));
-    return (vec4){ .x = 0.18f + r * 0.28f, .y = 0.12f + g * 0.2f, .z = 0.3f + b * 0.3f, .w = a };
-}
-
 static u64 str_hash(const char *s) {
     u64 h = 1469598103934665603ull;
     for (; *s; s++) { h ^= (u8)*s; h *= 1099511628211ull; }
@@ -153,7 +138,7 @@ static void sync_lib_keys(Dl_View *v, const Library *lib) {
     v->lib_keys = core_heap_alloc(sizeof(Lib_Key) * lib->track_count);
     for (u32 i = 0; i < lib->track_count; i++) {
         char k[DL_TEXT * 2];
-        dl_song_key(lib->tracks[i].title.str, k, sizeof(k));
+        dl_song_key((const char *)lib->tracks[i].title.str, k, sizeof(k));
         if (k[0]) v->lib_keys[v->lib_key_count++] = (Lib_Key){ .key = key_hash(k), .track = i };
     }
     qsort(v->lib_keys, v->lib_key_count, sizeof(Lib_Key), lib_key_cmp);
@@ -168,7 +153,7 @@ static b32 key_in_library(const Dl_View *v, const Library *lib, const char *song
         if (v->lib_keys[mid].key < h) lo = mid + 1; else hi = mid;
     }
     for (u32 i = lo; i < v->lib_key_count && v->lib_keys[i].key == h; i++)
-        if (dl_artist_plausible(lib->tracks[v->lib_keys[i].track].artist.str, known, raw_title)) return true;
+        if (dl_artist_plausible((const char *)lib->tracks[v->lib_keys[i].track].artist.str, known, raw_title)) return true;
     return false;
 }
 
@@ -253,7 +238,7 @@ static Ui_Interact pill_button(Ui *ui, u64 id, Core_String label, vec2 pos, vec2
 static void checkbox(Ui *ui, u64 id, vec2 c, f32 size, b32 checked, b32 partial, f32 hover, f32 a) {
     Core_Renderer *r = ui->r;
     f32 t = ui_spring(ui, ui_idx(id, 1), (checked || partial) ? 1.0f : 0.0f, 460, 24);
-    f32 tc = clamp01(t);
+    f32 tc = core_saturate(t);
     f32 s = size * (1 + 0.14f * (t - tc) + 0.05f * hover);
     vec2 p = vec2_make(c.x - s * 0.5f, c.y - s * 0.5f);
     if (tc > 0.02f)
@@ -284,7 +269,7 @@ static void ring(Ui *ui, vec2 c, f32 radius, f32 th, f32 t, vec4 col, f32 a) {
 static void bar(Ui *ui, vec2 p, vec2 sz, f32 t, f32 a, b32 shimmer) {
     Core_Renderer *r = ui->r;
     core_draw_rect_rounded(r, p, sz, sz.y * 0.5f, UI_RGBA(255, 255, 255, 0.09f * a));
-    f32 w = CORE_MAX(sz.y, sz.x * clamp01(t));
+    f32 w = CORE_MAX(sz.y, sz.x * core_saturate(t));
     if (t <= 0.001f) return;
     core_set_blend(r, CORE_BLEND_ADD);
     core_draw_shadow(r, p, vec2_make(w, sz.y), sz.y * 0.5f, S(8), UI_RGBA(139, 92, 246, 0.35f * a));
@@ -348,19 +333,15 @@ static void reset_results(Dl_View *v) {
 }
 
 static void trimmed_query(const Dl_View *v, char *out, u32 cap) {
-    u32 a = 0, n = v->query_len;
-    while (a < n && v->query[a] == ' ') a++;
-    while (n > a && v->query[n - 1] == ' ') n--;
-    u32 len = CORE_MIN(n - a, cap - 1);
-    memcpy(out, v->query + a, len);
-    out[len] = 0;
+    Core_String query = core_str_n((u8 *)v->query, v->query_len);
+    core_str_write_cstr(out, cap, core_str_trim_ascii(query));
 }
 
 static void start_search(Dl_View *v, b32 select_all) {
     char q[256];
     trimmed_query(v, q, sizeof(q));
     if (!q[0]) return;
-    copy_str(v->searched, sizeof(v->searched), q);
+    core_cstr_copy(v->searched, sizeof(v->searched), q);
     v->searched_kind = v->mode;
     v->has_searched = true;
     v->select_all_pending = select_all && v->mode == DL_QUERY_ARTIST;
@@ -377,8 +358,8 @@ static b32 query_is_stale(const Dl_View *v) {
 
 /* The artist a result is (presumably) by, for the "already in your library" check. */
 static void result_artist(const Dl_View *v, const Dl_Result *r, char *out, u32 cap) {
-    if (v->searched_kind == DL_QUERY_ARTIST) copy_str(out, cap, v->searched);
-    else if (r->artist[0]) copy_str(out, cap, r->artist);
+    if (v->searched_kind == DL_QUERY_ARTIST) core_cstr_copy(out, cap, v->searched);
+    else if (r->artist[0]) core_cstr_copy(out, cap, r->artist);
     else dl_clean_channel(r->channel, out, cap);
 }
 
@@ -505,11 +486,11 @@ static void draw_skeleton(Ui *ui, vec2 area, vec2 sz, f32 a, f32 row_h) {
 /* YouTube's own thumbnail when it has arrived (fading in over the placeholder). */
 static void draw_thumb(Dl_View *v, Ui *ui, const Dl_Result *r, vec2 p, f32 size, f32 a) {
     Ythumb th = ythumbs_get(v->thumbs, r->vid, ui->dt);
-    f32 fade = th.ready ? ease_out_cubic(th.age / 0.3f) : 0;
+    f32 fade = th.ready ? core_ease_out_cubic(th.age / 0.3f) : 0;
     if (th.ready && th.age < 0.35f) ui->animating = true;
     if (fade < 1) {
         u64 h = str_hash(r->vid);
-        Core_BoxStyle ph = { .radius = S(8), .fill = hash_color(h, a), .fill2 = UI_RGBA(24, 20, 40, a), .gradient = 1 };
+        Core_BoxStyle ph = { .radius = S(8), .fill = game_ui_hash_color(h, a), .fill2 = UI_RGBA(24, 20, 40, a), .gradient = 1 };
         core_draw_box(ui->r, p, vec2_make(size, size), &ph);
         ui_icon_note(ui, vec2_make(p.x + size * 0.5f, p.y + size * 0.5f), size * 0.42f, UI_RGBA(255, 255, 255, 0.3f * a));
     }
@@ -598,7 +579,7 @@ static b32 draw_results(Dl_View *v, Ui *ui, const Dlv_Frame *f, const Dl_SearchI
         Core_String label = core_str(lbl);
         f32 bw = ui_text_width(ui, ui->font_med, label, S(14)) + S(62), bh = S(36);
         f32 appear = ui_spring(ui, ui_id("dv.dlbtn"), sc.selected ? 1.0f : 0.0f, 380, 26);
-        f32 sc_a = clamp01(appear);
+        f32 sc_a = core_saturate(appear);
         if (appear > 0.01f) {
             vec2 bp = vec2_make(area.x + sz.x - bw - S(8) + (1 - sc_a) * S(14), hy - bh * 0.5f);
             download_clicked = pill_button(ui, ui_id("dv.download"), label, bp, vec2_make(bw, bh), true, sc.selected > 0 && live,
@@ -652,7 +633,7 @@ static b32 draw_results(Dl_View *v, Ui *ui, const Dlv_Frame *f, const Dl_SearchI
         Dl_Result res;
         if (!downloads_result(v->d, i, &res)) break;
         if (v->seen_at[i] == 0) v->seen_at[i] = ui->time;
-        f32 e = ease_out_cubic((f32)((ui->time - v->seen_at[i]) / 0.38));
+        f32 e = core_ease_out_cubic((f32)((ui->time - v->seen_at[i]) / 0.38));
         if (e < 1) ui->animating = true;
         Row_State st = row_state(v, f->lib, i, &res);
         f32 ra = a * e;
@@ -838,7 +819,7 @@ static void draw_dock(Dl_View *v, Ui *ui, vec2 win, f32 vis, b32 live, const Dl_
     f32 max_h = CORE_MIN(S(470), win.y * 0.62f);
     /* as tall as the list needs, up to the maximum */
     f32 full_h = pill_h + CORE_CLAMP(S(56) * (f32)sum->total + S(20), S(76), CORE_MAX(S(76), max_h - pill_h));
-    f32 h = core_lerp(pill_h, full_h, clamp01(v->dock_t));
+    f32 h = core_lerp(pill_h, full_h, core_saturate(v->dock_t));
     /* slide up when it first appears */
     f32 appear = ui_spring(ui, ui_id("dv.dock.in"), 1.0f, 300, 26);
     vec2 p = vec2_make((win.x - w) * 0.5f, win.y - S(24) - h + (1 - appear) * S(60));
@@ -853,7 +834,7 @@ static void draw_dock(Dl_View *v, Ui *ui, vec2 win, f32 vis, b32 live, const Dl_
     if (v->dock_t < 0) v->dock_t = 0;
     if (flash) ui->animating = true;
 
-    f32 a = vis * clamp01(appear);
+    f32 a = vis * core_saturate(appear);
     f32 glow = flash ? 0.5f + 0.5f * sinf((f32)ui->time * 8.0f) : 0;
     if (glow > 0) {
         core_set_blend(r, CORE_BLEND_ADD);
@@ -865,7 +846,7 @@ static void draw_dock(Dl_View *v, Ui *ui, vec2 win, f32 vis, b32 live, const Dl_
 
     /* ---- job list (above the pill row) ---- */
     f32 list_h = h - pill_h;
-    f32 expand = clamp01((v->dock_t - 0.08f) / 0.5f);
+    f32 expand = core_saturate((v->dock_t - 0.08f) / 0.5f);
     if (list_h > S(14) && expand > 0.01f) {
         u32 n = downloads_briefs(v->d, v->briefs, MAX_JOBS_SHOWN);
         u32 shown = build_order(v, n);
@@ -1009,20 +990,20 @@ static void draw_window_buttons(Ui *ui, Platform_Window *win, f32 right, f32 y, 
 /* Keep the text tail of a long path within max_w: ".../Music/Downloads". */
 static void path_tail(Ui *ui, const char *path, f32 px, f32 max_w, char *out, u32 cap) {
     Core_String full = core_str(path);
-    if (ui_text_width(ui, ui->font, full, px) <= max_w) { copy_str(out, cap, path); return; }
+    if (ui_text_width(ui, ui->font, full, px) <= max_w) { core_cstr_copy(out, cap, path); return; }
     u64 at = 0;
     Core_String ell = core_str_lit("\xE2\x80\xA6");
     f32 room = max_w - ui_text_width(ui, ui->font, ell, px);
     while (at < full.len && ui_text_width(ui, ui->font, core_str_substr(full, at, full.len - at), px) > room) {
-        at++;
-        while (at < full.len && (full.str[at] & 0xC0) == 0x80) at++;
+        at += core_utf8_decode(full, at).size;
     }
     snprintf(out, cap, "\xE2\x80\xA6%s", path + at);
 }
 
 static void edit_query(Dl_View *v, const Platform_Input *in) {
     if (in->text_len) {
-        u32 n = CORE_MIN(in->text_len, (u32)sizeof(v->query) - 1 - v->query_len);
+        u32 n = (u32)core_str_prefix_utf8(core_str_n((u8 *)in->text, in->text_len),
+                                        sizeof(v->query) - 1 - v->query_len).len;
         memcpy(v->query + v->query_len, in->text, n);
         v->query_len += n;
         v->query[v->query_len] = 0;
@@ -1033,9 +1014,7 @@ static void edit_query(Dl_View *v, const Platform_Input *in) {
             while (v->query_len && v->query[v->query_len - 1] == ' ') v->query_len--;
             while (v->query_len && v->query[v->query_len - 1] != ' ') v->query_len--;
         } else {
-            u32 n = v->query_len - 1;
-            while (n > 0 && ((u8)v->query[n] & 0xC0) == 0x80) n--;
-            v->query_len = n;
+            v->query_len = (u32)core_utf8_prev(core_str_n((u8 *)v->query, v->query_len), v->query_len);
         }
         v->query[v->query_len] = 0;
         v->caret_hold = 0.5f;
@@ -1049,7 +1028,7 @@ void dlv_draw(Dl_View *v, Ui *ui, const Dlv_Frame *f, Dlv_Out *out) {
     v->open_t = open;
     if (open < 0.004f && !v->open) return;
     ythumbs_update(v->thumbs);
-    f32 vis = clamp01(open);
+    f32 vis = core_saturate(open);
     b32 live = v->open && !f->blocked;
     vec2 win = ui->size;
     ui->input_enabled = live;
@@ -1064,7 +1043,7 @@ void dlv_draw(Dl_View *v, Ui *ui, const Dlv_Frame *f, Dlv_Out *out) {
         v->gen = info.generation;
         reset_results(v);
         v->has_searched = info.state != DL_SEARCH_IDLE;
-        copy_str(v->searched, sizeof(v->searched), info.query);
+        core_cstr_copy(v->searched, sizeof(v->searched), info.query);
         v->searched_kind = info.kind;
     }
     if (info.count > v->seen_count) {
@@ -1223,7 +1202,7 @@ void dlv_draw(Dl_View *v, Ui *ui, const Dlv_Frame *f, Dlv_Out *out) {
     f32 bottom_pad = v->dock_size.x > 0 ? S(110) : S(24);
     vec2 body_pos = vec2_make(x0, top_y + bs.y + S(18) + slide * 0.2f);
     vec2 body_size = vec2_make(cw, win.y - body_pos.y - S(8));
-    f32 body_a = vis * clamp01((dock_e - 0.55f) / 0.45f); /* fades in as the bar arrives */
+    f32 body_a = vis * core_saturate((dock_e - 0.55f) / 0.45f); /* fades in as the bar arrives */
     b32 rows_live = live && !over_dock && dock_e > 0.98f;
 
     if (!tools_ok) {
@@ -1276,7 +1255,7 @@ b32 dlv_draw_status(Dl_View *v, Ui *ui, vec2 pos) {
     b32 show_done = !busy && ui->time < v->pill_done_until;
     f32 shown = ui_spring(ui, ui_id("dv.pill.in"), (busy || show_done) ? 1.0f : 0.0f, 340, 28);
     if (shown < 0.01f && !busy && !show_done) return false;
-    f32 a = clamp01(shown);
+    f32 a = core_saturate(shown);
     if (show_done) ui->animating = true;
 
     char l1[96], l2[DL_TEXT * 3] = {0};
@@ -1360,7 +1339,7 @@ b32 dlv_visible(const Dl_View *v) { return v && (v->open || v->open_t > 0.004f);
 
 void dlv_search(Dl_View *v, u32 kind, const char *query, b32 select_all) {
     v->mode = kind == DL_QUERY_ARTIST ? DL_QUERY_ARTIST : DL_QUERY_SONG;
-    snprintf(v->query, sizeof(v->query), "%s", query);
+    core_cstr_copy(v->query, sizeof(v->query), query);
     v->query_len = (u32)strlen(v->query);
     v->dock_pinned = false;
     start_search(v, select_all);

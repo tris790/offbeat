@@ -245,6 +245,8 @@ const u8   *platform_file_map(const char *path, u64 *out_size);
 
 /* Environment variable or 0. */
 const char *platform_env(const char *name);
+/* Set an environment variable; overwrite=false preserves an existing value. */
+b32 platform_env_set(const char *name, const char *value, b32 overwrite);
 
 /* ---- child processes ----
  *

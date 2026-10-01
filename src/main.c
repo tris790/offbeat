@@ -72,7 +72,7 @@ int main(void)
     u32 flags = PLATFORM_WINDOW_TRANSPARENT;
     if (headless) {
         flags |= PLATFORM_WINDOW_HEADLESS;
-        setenv("OFFBEAT_MUTE", "1", 0); /* screenshots never make sound */
+        platform_env_set("OFFBEAT_MUTE", "1", false); /* screenshots never make sound */
     }
 
     Platform_Window *win = platform_window_open("Offbeat", "offbeat", win_w, win_h, flags);

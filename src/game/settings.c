@@ -39,9 +39,7 @@ void settings_parse(Settings *s, Core_String text) {
         u64 end = at;
         while (end < text.len && text.str[end] != '\n') end++;
         char line[1200];
-        u64 n = CORE_MIN(end - at, (u64)sizeof(line) - 1);
-        memcpy(line, text.str + at, n);
-        line[n] = 0;
+        u64 n = core_str_write_cstr(line, sizeof(line), core_str_substr(text, at, end - at));
         while (n && (line[n - 1] == '\r' || line[n - 1] == ' ')) line[--n] = 0;
         at = end + 1;
 
@@ -50,7 +48,7 @@ void settings_parse(Settings *s, Core_String text) {
         *sp = 0;
         const char *key = line, *val = sp + 1;
         if (strcmp(key, "music_dir") == 0) {
-            snprintf(s->music_dir, sizeof(s->music_dir), "%s", val);
+            core_cstr_copy(s->music_dir, sizeof(s->music_dir), val);
         } else if (strcmp(key, "theme") == 0) {
             u32 i = find_id(val, SETTINGS_THEME_COUNT, theme_id);
             if (i != UINT32_MAX) s->theme = i;
@@ -60,7 +58,7 @@ void settings_parse(Settings *s, Core_String text) {
         } else if (strcmp(key, "debug") == 0) {
             s->debug = atoi(val) != 0;
         } else if (strcmp(key, "download_dir") == 0) {
-            snprintf(s->download_dir, sizeof(s->download_dir), "%s", val);
+            core_cstr_copy(s->download_dir, sizeof(s->download_dir), val);
         } else if (strcmp(key, "download_parallel") == 0) {
             s->download_parallel = CORE_CLAMP((u32)atoi(val), 1u, 3u);
         }
@@ -100,11 +98,5 @@ b32 settings_theme_matrix(u32 theme, f32 out[9]) {
 }
 
 vec3 settings_theme_apply(const f32 m[9], vec3 c) {
-    vec3 o = {
-        .x = m[0] * c.x + m[1] * c.y + m[2] * c.z,
-        .y = m[3] * c.x + m[4] * c.y + m[5] * c.z,
-        .z = m[6] * c.x + m[7] * c.y + m[8] * c.z,
-    };
-    o.x = CORE_CLAMP(o.x, 0.0f, 1.0f); o.y = CORE_CLAMP(o.y, 0.0f, 1.0f); o.z = CORE_CLAMP(o.z, 0.0f, 1.0f);
-    return o;
+    return core_color_matrix_apply(m, c);
 }

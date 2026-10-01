@@ -2,30 +2,6 @@
 
 #include "filter.h"
 
-u8 search_fold(u32 cp) {
-    if (cp < 0x80) {
-        if (cp >= 'A' && cp <= 'Z') return (u8)(cp + 32);
-        return (u8)cp;
-    }
-    /* Latin-1 supplement + Latin Extended-A letters -> base letter
-       (generated from Unicode NFKD decompositions; '?' = no base letter). */
-    static const char latin1[] =
-        "aaaaaaaceeeeiiiidnooooo?ouuuuyts"
-        "aaaaaaaceeeeiiiidnooooo?ouuuuyty";
-    static const char ext_a[] =
-        "aaaaaaccccccccddddeeeeeeeeeegggggggghhhhiiiiiiiiiiiijjkkklllllll"
-        "lllnnnnnnnnnoooooooorrrrrrssssssssttttttuuuuuuuuuuuuwwyyyzzzzzzs";
-    if (cp >= 0xC0 && cp <= 0xFF) {
-        char c = latin1[cp - 0xC0];
-        return c == '?' ? 0xFF : (u8)c;
-    }
-    if (cp >= 0x100 && cp <= 0x17F) {
-        char c = ext_a[cp - 0x100];
-        return c == '?' ? 0xFF : (u8)c;
-    }
-    return 0xFF; /* caller preserves the original codepoint for other scripts */
-}
-
 /* Field weights (/8): a title hit beats the same hit in the artist, which
    beats the album. */
 static const s32 FIELD_WEIGHT[SEARCH_FIELDS] = { 8, 6, 5 };

@@ -5,9 +5,11 @@
 #include "ytthumbs.h"
 
 #include "../core/memory.h"
+#include "../core/image.h"
 #include "../platform/platform.h"
 #include "../third_party/stb_image.h"
 
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,6 +19,8 @@
 #define YT_ROWS   11
 #define YT_SLOTS  (YT_COLS * YT_ROWS)
 #define YT_QUEUE  192
+#define YT_MAX_FILE_BYTES CORE_MB(2)
+#define YT_MAX_PIXELS (1024u * 1024u)
 #define YT_DONE   12
 
 typedef enum { SLOT_FREE = 0, SLOT_PENDING, SLOT_READY, SLOT_MISSING } Slot_State;
@@ -33,6 +37,8 @@ typedef struct { u32 slot; char vid[12]; u8 *rgba; } Finished; /* rgba == 0: fai
 
 struct Ythumbs {
     Core_Renderer *r;
+    Core_ImageColorTables color_tables;
+    _Alignas(f32) u8 image_scratch[YT_SLOT * CORE_IMAGE_SCRATCH_PER_PIXEL];
     Core_Texture   atlas;
     char           dir[1024];
     Slot           slots[YT_SLOTS];
@@ -40,37 +46,13 @@ struct Ythumbs {
 
     Platform_Mutex mu;
     Platform_Cond  cv;
-    b32            quit;
+    _Atomic b32    quit;
     Platform_Thread *thread;
     Request        queue[YT_QUEUE];
     u32            queue_len;
     Finished       done[YT_DONE];
     u32            done_len;
 };
-
-/* Center-crop to a square and box-downscale to YT_SLOT. */
-static void to_slot(const u8 *src, u32 sw, u32 sh, u32 ch, u8 *dst) {
-    u32 side = sw < sh ? sw : sh;
-    u32 ox = (sw - side) / 2, oy = (sh - side) / 2;
-    for (u32 y = 0; y < YT_SLOT; y++) {
-        u32 y0 = oy + (u32)((u64)y * side / YT_SLOT), y1 = oy + (u32)((u64)(y + 1) * side / YT_SLOT);
-        if (y1 <= y0) y1 = y0 + 1;
-        for (u32 x = 0; x < YT_SLOT; x++) {
-            u32 x0 = ox + (u32)((u64)x * side / YT_SLOT), x1 = ox + (u32)((u64)(x + 1) * side / YT_SLOT);
-            if (x1 <= x0) x1 = x0 + 1;
-            u32 acc[3] = {0, 0, 0}, n = 0;
-            for (u32 yy = y0; yy < y1 && yy < sh; yy++)
-                for (u32 xx = x0; xx < x1 && xx < sw; xx++) {
-                    const u8 *p = src + ((u64)yy * sw + xx) * ch;
-                    acc[0] += p[0]; acc[1] += p[ch > 2 ? 1 : 0]; acc[2] += p[ch > 2 ? 2 : 0];
-                    n++;
-                }
-            if (!n) n = 1;
-            u8 *d = dst + ((u64)y * YT_SLOT + x) * 4;
-            d[0] = (u8)(acc[0] / n); d[1] = (u8)(acc[1] / n); d[2] = (u8)(acc[2] / n); d[3] = 255;
-        }
-    }
-}
 
 /* Make sure the JPEG is on disk (downloading it with curl if needed) and decode it. */
 static u8 *fetch_and_decode(Ythumbs *t, const char *vid) {
@@ -91,16 +73,19 @@ static u8 *fetch_and_decode(Ythumbs *t, const char *vid) {
         if (code != 0 || !platform_file_info(part).exists) { platform_file_remove(part); return 0; }
         platform_file_rename(part, path);
     }
+    fi = platform_file_info(path);
+    if (!fi.exists || !fi.size || fi.size > YT_MAX_FILE_BYTES) return 0;
     Core_Arena scratch;
-    if (!core_arena_init(&scratch, CORE_MB(8))) return 0;
+    if (!core_arena_init(&scratch, YT_MAX_FILE_BYTES + 4096)) return 0;
     Core_String file = platform_file_read_all(&scratch, path);
     u8 *out = 0;
-    if (file.len) {
-        int w, h, ch;
+    int w = 0, h = 0, ch = 0;
+    if (file.len && stbi_info_from_memory(file.str, (int)file.len, &w, &h, &ch) &&
+        w > 0 && h > 0 && (u64)w * h <= YT_MAX_PIXELS) {
         u8 *px = stbi_load_from_memory(file.str, (int)file.len, &w, &h, &ch, 3);
         if (px && w > 0 && h > 0) {
             out = core_heap_alloc((u64)YT_SLOT * YT_SLOT * 4);
-            to_slot(px, (u32)w, (u32)h, 3, out);
+            if (out) core_image_resize_square(&t->color_tables, px, (u32)w, (u32)h, 3, out, YT_SLOT, t->image_scratch, YT_SLOT);
         }
         if (px) stbi_image_free(px);
     }
@@ -132,6 +117,8 @@ static void worker_main(void *arg) {
 
 Ythumbs *ythumbs_create(Core_Renderer *r, const char *cache_dir) {
     Ythumbs *t = core_heap_calloc(sizeof(*t));
+    if (!t) return 0;
+    core_image_color_tables_init(&t->color_tables);
     t->r = r;
     snprintf(t->dir, sizeof(t->dir), "%s/ytthumbs", cache_dir);
     platform_make_dirs(t->dir);
@@ -139,6 +126,11 @@ Ythumbs *ythumbs_create(Core_Renderer *r, const char *cache_dir) {
     platform_cond_init(&t->cv);
     t->atlas = core_texture_create(r, CORE_TEXTURE_RGBA8, YT_COLS * YT_SLOT, YT_ROWS * YT_SLOT, 0, false);
     t->thread = platform_thread_start(worker_main, t, "yt-thumbs");
+    if (!t->thread) {
+        core_texture_destroy(t->r, t->atlas);
+        core_heap_free(t);
+        return 0;
+    }
     return t;
 }
 
@@ -155,6 +147,7 @@ void ythumbs_destroy(Ythumbs *t) {
 }
 
 void ythumbs_update(Ythumbs *t) {
+    if (!t) return;
     t->frame++;
     platform_mutex_lock(&t->mu);
     u32 n = t->done_len < 3 ? t->done_len : 3; /* a few per frame keeps uploads smooth */
@@ -180,6 +173,7 @@ void ythumbs_update(Ythumbs *t) {
 }
 
 Ythumb ythumbs_get(Ythumbs *t, const char *vid, f32 dt) {
+    if (!t) return (Ythumb){.missing = true};
     Ythumb out = { .tex = t->atlas };
     Slot *found = 0, *victim = 0;
     for (u32 i = 0; i < YT_SLOTS; i++) {
@@ -192,13 +186,13 @@ Ythumb ythumbs_get(Ythumbs *t, const char *vid, f32 dt) {
         if (!victim || victim->used == t->frame) return out; /* every slot is in use this frame */
         u32 idx = (u32)(victim - t->slots);
         memset(victim, 0, sizeof(*victim));
-        snprintf(victim->vid, sizeof(victim->vid), "%s", vid);
+        core_cstr_copy(victim->vid, sizeof(victim->vid), vid);
         victim->state = SLOT_PENDING;
         victim->used = t->frame;
         platform_mutex_lock(&t->mu);
         if (t->queue_len == YT_QUEUE) memmove(t->queue, t->queue + 1, sizeof(Request) * (YT_QUEUE - 1)), t->queue_len--;
         Request *q = &t->queue[t->queue_len++];
-        snprintf(q->vid, sizeof(q->vid), "%s", vid);
+        core_cstr_copy(q->vid, sizeof(q->vid), vid);
         q->slot = idx;
         platform_mutex_unlock(&t->mu);
         platform_cond_broadcast(&t->cv);

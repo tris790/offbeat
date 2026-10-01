@@ -8,6 +8,7 @@
  */
 
 #include "download.h"
+#include "../core/random.h"
 
 #include "../platform/platform.h"
 
@@ -29,33 +30,9 @@
 /* text helpers                                                              */
 /* ------------------------------------------------------------------------- */
 
-static void copy_to(char *dst, u32 cap, const char *src) {
-    if (!cap) return;
-    u32 n = (u32)strlen(src);
-    if (n >= cap) {
-        n = cap - 1;
-        while (n > 0 && ((u8)src[n] & 0xC0) == 0x80) n--; /* never cut a UTF-8 sequence */
-    }
-    memcpy(dst, src, n);
-    dst[n] = 0;
-}
-
-static b32 ci_prefix(const char *s, const char *prefix) {
-    for (; *prefix; s++, prefix++)
-        if (tolower((u8)*s) != tolower((u8)*prefix)) return false;
-    return true;
-}
-
-static b32 ci_suffix(const char *s, const char *suffix) {
-    size_t n = strlen(s), m = strlen(suffix);
-    return n >= m && ci_prefix(s + n - m, suffix);
-}
-
 static void trim(char *s) {
-    size_t n = strlen(s), a = 0;
-    while (n && (s[n - 1] == ' ')) s[--n] = 0;
-    while (s[a] == ' ') a++;
-    if (a) memmove(s, s + a, n - a + 1);
+    Core_String text = core_str(s);
+    core_str_write_cstr(s, text.len + 1, core_str_trim_ascii(text));
 }
 
 void dl_clean_field(char *s) {
@@ -90,7 +67,7 @@ static u32 separator_at(const char *t) {
         while (*w == ' ') w++;
         for (u32 i = 0; i < CORE_ARRAY_COUNT(words); i++) {
             size_t n = strlen(words[i]);
-            if (ci_prefix(w, words[i]) && (w[n] == ' ' || w[n] == ':')) {
+            if (core_cstr_starts_ascii_ci(w, words[i]) && (w[n] == ' ' || w[n] == ':')) {
                 const char *e = w + n;
                 if (*e == ':') e++;
                 while (*e == ' ') e++;
@@ -120,7 +97,7 @@ static u32 separator_at(const char *t) {
 
 void dl_primary_artist(const char *artist, char *out, u32 cap) {
     char tmp[DL_TEXT];
-    copy_to(tmp, sizeof(tmp), artist);
+    core_cstr_copy(tmp, sizeof(tmp), artist);
     trim(tmp);
     size_t n = strlen(tmp);
 
@@ -142,17 +119,17 @@ void dl_primary_artist(const char *artist, char *out, u32 cap) {
         if (!depth && i > 0 && separator_at(tmp + i)) { tmp[i] = 0; break; }
     }
     trim(tmp);
-    copy_to(out, cap, tmp[0] ? tmp : artist);
+    core_cstr_copy(out, cap, tmp[0] ? tmp : artist);
 }
 
 void dl_clean_channel(const char *channel, char *out, u32 cap) {
     char tmp[DL_TEXT];
-    copy_to(tmp, sizeof(tmp), channel);
+    core_cstr_copy(tmp, sizeof(tmp), channel);
     trim(tmp);
-    if (ci_suffix(tmp, " - Topic")) tmp[strlen(tmp) - 8] = 0;
-    else if (strlen(tmp) > 4 && ci_suffix(tmp, "VEVO")) tmp[strlen(tmp) - 4] = 0;
+    if (core_cstr_ends_ascii_ci(tmp, " - Topic")) tmp[strlen(tmp) - 8] = 0;
+    else if (strlen(tmp) > 4 && core_cstr_ends_ascii_ci(tmp, "VEVO")) tmp[strlen(tmp) - 4] = 0;
     trim(tmp);
-    copy_to(out, cap, tmp);
+    core_cstr_copy(out, cap, tmp);
 }
 
 static b32 junk_tag_word(const char *w, size_t n) {
@@ -161,7 +138,7 @@ static b32 junk_tag_word(const char *w, size_t n) {
         "hd", "hq", "4k", "1080p", "720p", "mv", "clip", "with", "explicit", "full", "song",
     };
     for (u32 i = 0; i < CORE_ARRAY_COUNT(junk); i++)
-        if (strlen(junk[i]) == n && strncasecmp(w, junk[i], n) == 0) return true;
+        if (strlen(junk[i]) == n && core_str_eq_ascii_ci(core_str_n((u8 *)w, n), core_str(junk[i]))) return true;
     return false;
 }
 
@@ -182,11 +159,11 @@ static b32 junk_group(const char *s, size_t open, size_t close) {
 
 void dl_clean_title(const char *title, const char *artist, char *out, u32 cap) {
     char t[DL_TEXT * 2];
-    copy_to(t, sizeof(t), title);
+    core_cstr_copy(t, sizeof(t), title);
     trim(t);
     const char *start = t;
     size_t alen = artist ? strlen(artist) : 0;
-    if (alen && ci_prefix(t, artist)) {
+    if (alen && core_cstr_starts_ascii_ci(t, artist)) {
         const char *p = t + alen;
         while (*p == ' ') p++;
         if (*p == '-' || *p == ':' || ((u8)p[0] == 0xE2 && (u8)p[1] == 0x80 && ((u8)p[2] == 0x93 || (u8)p[2] == 0x94))) {
@@ -196,7 +173,7 @@ void dl_clean_title(const char *title, const char *artist, char *out, u32 cap) {
         }
     }
     char work[DL_TEXT * 2];
-    copy_to(work, sizeof(work), start);
+    core_cstr_copy(work, sizeof(work), start);
     for (;;) {
         size_t n = strlen(work);
         while (n && work[n - 1] == ' ') work[--n] = 0;
@@ -208,7 +185,7 @@ void dl_clean_title(const char *title, const char *artist, char *out, u32 cap) {
         work[o] = 0;
     }
     trim(work);
-    copy_to(out, cap, work[0] ? work : t);
+    core_cstr_copy(out, cap, work[0] ? work : t);
 }
 
 /* ---- song / artist keys (what "the same song" means) ---- */
@@ -223,7 +200,7 @@ static b32 release_word(const char *w, size_t n) {
     for (size_t i = 0; i < n; i++) digits = digits && isdigit((u8)w[i]); /* a year */
     if (digits || junk_tag_word(w, n)) return true;
     for (u32 i = 0; i < CORE_ARRAY_COUNT(words); i++)
-        if (strlen(words[i]) == n && strncasecmp(w, words[i], n) == 0) return true;
+        if (strlen(words[i]) == n && core_str_eq_ascii_ci(core_str_n((u8 *)w, n), core_str(words[i]))) return true;
     return false;
 }
 
@@ -260,7 +237,7 @@ static b32 variant_tags(const char *s, size_t len) {
         any = true;
         all_release = all_release && release_word(s + st, n);
         for (u32 j = 0; j < CORE_ARRAY_COUNT(markers); j++)
-            if (strlen(markers[j]) == n && !strncasecmp(s + st, markers[j], n)) return true;
+            if (strlen(markers[j]) == n && core_str_eq_ascii_ci(core_str_n((u8 *)s + st, n), core_str(markers[j]))) return true;
     }
     return any && all_release;
 }
@@ -288,14 +265,14 @@ static b32 credit_words(const char *s, size_t len) {
     size_t st = i;
     while (i < len && isalnum((u8)s[i])) i++;
     size_t n = i - st;
-    return (n == 2 && strncasecmp(s + st, "ft", 2) == 0) || (n == 4 && strncasecmp(s + st, "feat", 4) == 0) ||
-           (n == 9 && strncasecmp(s + st, "featuring", 9) == 0);
+    return (n == 2 && core_str_eq_ascii_ci(core_str_n((u8 *)s + st, 2), core_str_lit("ft"))) || (n == 4 && core_str_eq_ascii_ci(core_str_n((u8 *)s + st, 4), core_str_lit("feat"))) ||
+           (n == 9 && core_str_eq_ascii_ci(core_str_n((u8 *)s + st, 9), core_str_lit("featuring")));
 }
 
 /* Lowercase letters and digits (and any UTF-8 bytes) of `s`. */
 static u32 fold_append(const char *s, char *out, u32 w, u32 cap) {
     for (const u8 *p = (const u8 *)s; *p && w + 1 < cap; p++)
-        if (isalnum(*p) || *p >= 0x80) out[w++] = (char)tolower(*p);
+        if (isalnum(*p) || *p >= 0x80) out[w++] = (char)core_ascii_lower(*p);
     out[w] = 0;
     return w;
 }
@@ -303,7 +280,7 @@ static u32 fold_append(const char *s, char *out, u32 w, u32 cap) {
 void dl_song_key(const char *title, char *out, u32 cap) {
     if (!cap) return;
     char t[DL_TEXT * 2];
-    copy_to(t, sizeof(t), title);
+    core_cstr_copy(t, sizeof(t), title);
     /* Plain titles take one folding pass. Only spaces that could introduce
        credits or bare suffixes, brackets, and spaced dashes need parsing. */
     b32 annotated = false;
@@ -312,10 +289,10 @@ void dl_song_key(const char *title, char *out, u32 cap) {
         u8 c = (u8)t[i];
         if (c == '(' || c == '[') annotated = true;
         if (c == ' ') {
-            u8 next = (u8)tolower((u8)t[i + 1]);
+            u8 next = (u8)core_ascii_lower((u8)t[i + 1]);
             if (next == 'f' || next == 'i' || next == 'a' || next == 'r' || next == '-') annotated = true;
         }
-        if ((isalnum(c) || c >= 0x80) && plain + 1 < cap) out[plain++] = (char)tolower(c);
+        if ((isalnum(c) || c >= 0x80) && plain + 1 < cap) out[plain++] = (char)core_ascii_lower(c);
     }
     out[plain] = 0;
     if (!annotated) return;
@@ -325,15 +302,14 @@ void dl_song_key(const char *title, char *out, u32 cap) {
     if (dash && variant_tags(dash + 3, strlen(dash + 3))) *dash = 0;
     static const char *const feats[] = { " feat. ", " feat ", " ft. ", " ft ", " featuring " };
     for (u32 i = 0; i < CORE_ARRAY_COUNT(feats); i++) {
-        size_t fl = strlen(feats[i]);
         for (char *p = t; *p; p++)
-            if (*p == ' ' && strncasecmp(p, feats[i], fl) == 0) { *p = 0; break; }
+            if (*p == ' ' && core_cstr_starts_ascii_ci(p, feats[i])) { *p = 0; break; }
     }
     static const char *const tails[] = { " instrumental", " acapella", " accapella", " a cappella", " radio edit" };
     size_t title_len = strlen(t);
     for (u32 i = 0; i < CORE_ARRAY_COUNT(tails); i++) {
         size_t len = strlen(tails[i]);
-        if (title_len > len && ci_prefix(t + title_len - len, tails[i])) {
+        if (title_len > len && core_cstr_starts_ascii_ci(t + title_len - len, tails[i])) {
             title_len -= len;
             t[title_len] = 0;
         }
@@ -347,7 +323,7 @@ void dl_song_key(const char *title, char *out, u32 cap) {
                 i = end;
             continue;
         }
-        if (isalnum(c) || c >= 0x80) out[w++] = (char)tolower(c);
+        if (isalnum(c) || c >= 0x80) out[w++] = (char)core_ascii_lower(c);
     }
     out[w] = 0;
     if (!w) fold_append(title, out, 0, cap); /* a title that is all tags */
@@ -396,7 +372,7 @@ void dl_path_segment(const char *in, char *out, u32 cap) {
     }
     tmp[w] = 0;
     /* file systems cap names at 255 bytes; leave room for ".mp3.part" */
-    if (w > 150) { w = 150; while (w && ((u8)tmp[w] & 0xC0) == 0x80) w--; tmp[w] = 0; }
+    if (w > 150) { w = (u32)core_str_prefix_utf8(core_str_n((u8 *)tmp, w), 150).len; tmp[w] = 0; }
     for (;;) {
         while (w && (tmp[w - 1] == ' ' || tmp[w - 1] == '.')) tmp[--w] = 0;
         if (w >= 2 && tmp[w - 2] == ' ' && tmp[w - 1] == '-') tmp[w -= 2] = 0; /* "What?" -> "What" */
@@ -404,15 +380,15 @@ void dl_path_segment(const char *in, char *out, u32 cap) {
     }
     char *s = tmp;
     while (*s == '.' || *s == ' ') s++; /* a leading dot would make the file hidden (the library skips those) */
-    if (!*s || !strcmp(s, "-")) { copy_to(out, cap, "_"); return; }
-    if ((ci_prefix(s, "con") || ci_prefix(s, "prn") || ci_prefix(s, "aux") || ci_prefix(s, "nul")) &&
+    if (!*s || !strcmp(s, "-")) { core_cstr_copy(out, cap, "_"); return; }
+    if ((core_cstr_starts_ascii_ci(s, "con") || core_cstr_starts_ascii_ci(s, "prn") || core_cstr_starts_ascii_ci(s, "aux") || core_cstr_starts_ascii_ci(s, "nul")) &&
         (s[3] == 0 || s[3] == '.')) {
         char buf[340];
         snprintf(buf, sizeof(buf), "_%s", s);
-        copy_to(out, cap, buf);
+        core_cstr_copy(out, cap, buf);
         return;
     }
-    copy_to(out, cap, s);
+    core_cstr_copy(out, cap, s);
 }
 
 void dl_dest_path(const char *dest_dir, const char *artist, const char *title, char *out, u32 cap) {
@@ -435,7 +411,7 @@ static b32 valid_video_id(const char *id) {
 
 b32 dl_parse_result_line(const char *line, Dl_Result *out) {
     char buf[1024];
-    copy_to(buf, sizeof(buf), line);
+    core_cstr_copy(buf, sizeof(buf), line);
     char *f[5] = {0};
     u32 n = split_fields(buf, 0x1f, f, 5);
     if (n < 2 || !valid_video_id(f[0])) return false;
@@ -443,8 +419,8 @@ b32 dl_parse_result_line(const char *line, Dl_Result *out) {
     memcpy(out->vid, f[0], 12);
     for (u32 i = 1; i < n; i++) { dl_clean_field(f[i]); f[i] = (char *)na(f[i]); }
     if (!f[1][0]) return false;
-    copy_to(out->title, sizeof(out->title), f[1]);
-    if (n > 2) copy_to(out->channel, sizeof(out->channel), f[2]);
+    core_cstr_copy(out->title, sizeof(out->title), f[1]);
+    if (n > 2) core_cstr_copy(out->channel, sizeof(out->channel), f[2]);
     if (n > 3 && atof(f[3]) > 0) out->duration_s = (u32)atof(f[3]);
     if (n > 4 && atof(f[4]) > 0) out->views = (u64)atof(f[4]);
     return true;
@@ -453,7 +429,7 @@ b32 dl_parse_result_line(const char *line, Dl_Result *out) {
 b32 dl_parse_enrich_line(const char *line, Dl_Result *out) {
     if (strncmp(line, "OBE" US, 4) != 0) return false;
     char buf[1024];
-    copy_to(buf, sizeof(buf), line + 4);
+    core_cstr_copy(buf, sizeof(buf), line + 4);
     char *f[4] = {0};
     u32 n = split_fields(buf, 0x1f, f, 4);
     if (n < 4 || !valid_video_id(f[0])) return false;
@@ -462,7 +438,7 @@ b32 dl_parse_enrich_line(const char *line, Dl_Result *out) {
     memcpy(out->vid, f[0], 12);
     if (f[1][0]) dl_primary_artist(f[1], out->artist, sizeof(out->artist));
     if (atof(f[2]) > 0) out->duration_s = (u32)atof(f[2]);
-    copy_to(out->title, sizeof(out->title), f[3]);
+    core_cstr_copy(out->title, sizeof(out->title), f[3]);
     return true;
 }
 
@@ -481,7 +457,7 @@ b32 dl_parse_progress_line(const char *line, f32 *fraction) {
 b32 dl_parse_meta_line(const char *line, Dl_Job *job) {
     if (strncmp(line, "OBM" US, 4) != 0) return false;
     char buf[2048];
-    copy_to(buf, sizeof(buf), line + 4);
+    core_cstr_copy(buf, sizeof(buf), line + 4);
     char *f[12] = {0};
     u32 n = split_fields(buf, 0x1f, f, 12);
     if (n < 11) return false;
@@ -489,17 +465,17 @@ b32 dl_parse_meta_line(const char *line, Dl_Job *job) {
     /* 0 track, 1 title, 2 artist, 3 album, 4 release year, 5 upload year,
        6 duration, 7 genre, 8 channel, 9 track number, 10 uploader */
     char credit[DL_TEXT];
-    if (f[2][0]) copy_to(credit, sizeof(credit), f[2]);
+    if (f[2][0]) core_cstr_copy(credit, sizeof(credit), f[2]);
     else if (f[8][0]) dl_clean_channel(f[8], credit, sizeof(credit));
     else dl_clean_channel(f[10], credit, sizeof(credit));
     if (credit[0]) dl_primary_artist(credit, job->artist, sizeof(job->artist));
-    if (f[0][0]) copy_to(job->title, sizeof(job->title), f[0]);
+    if (f[0][0]) core_cstr_copy(job->title, sizeof(job->title), f[0]);
     else if (f[1][0]) dl_clean_title(f[1], job->artist, job->title, sizeof(job->title));
-    if (f[3][0]) copy_to(job->album, sizeof(job->album), f[3]);
+    if (f[3][0]) core_cstr_copy(job->album, sizeof(job->album), f[3]);
     u32 year = (u32)atoi(f[4][0] ? f[4] : f[5]);
     if (year >= 1000 && year <= 2999) job->year = year;
     if (atof(f[6]) > 0) job->duration_s = (u32)atof(f[6]);
-    if (f[7][0]) copy_to(job->genre, sizeof(job->genre), f[7]);
+    if (f[7][0]) core_cstr_copy(job->genre, sizeof(job->genre), f[7]);
     if (atoi(f[9]) > 0) job->track = (u32)atoi(f[9]);
     return true;
 }
@@ -552,12 +528,12 @@ u32 dl_jobs_parse(Core_String text, Dl_Job *out, u32 max, u64 *next_uid) {
         j->year = (u32)atoi(f[4]);
         j->track = (u32)atoi(f[5]);
         j->duration_s = (u32)atoi(f[6]);
-        copy_to(j->title, sizeof(j->title), f[7]);
-        copy_to(j->artist, sizeof(j->artist), f[8]);
-        copy_to(j->album, sizeof(j->album), f[9]);
-        copy_to(j->genre, sizeof(j->genre), f[10]);
-        copy_to(j->path, sizeof(j->path), f[11]);
-        copy_to(j->error, sizeof(j->error), f[12]);
+        core_cstr_copy(j->title, sizeof(j->title), f[7]);
+        core_cstr_copy(j->artist, sizeof(j->artist), f[8]);
+        core_cstr_copy(j->album, sizeof(j->album), f[9]);
+        core_cstr_copy(j->genre, sizeof(j->genre), f[10]);
+        core_cstr_copy(j->path, sizeof(j->path), f[11]);
+        core_cstr_copy(j->error, sizeof(j->error), f[12]);
         j->progress = j->state == DL_DONE ? 1.0f : 0.0f;
         if (!j->uid) continue;
         count++;
@@ -618,10 +594,7 @@ struct Downloads {
     char  keys[DL_MAX_RESULTS][DL_TEXT]; /* dl_song_key of each result's title */
 };
 
-static u32 rng_next(Downloads *d) {
-    d->rng ^= d->rng << 13; d->rng ^= d->rng >> 17; d->rng ^= d->rng << 5;
-    return d->rng;
-}
+
 
 static f64 now_s(void) { return platform_time_seconds(); }
 
@@ -671,9 +644,9 @@ static void probe_tools(Downloads *d) {
     const char *f = platform_env("OFFBEAT_FFMPEG");
     char tmp[512];
     d->tools.ytdlp = find_tool(y ? y : "yt-dlp", tmp, sizeof(tmp));
-    copy_to(d->tools.ytdlp_path, sizeof(d->tools.ytdlp_path), d->tools.ytdlp ? tmp : "yt-dlp");
+    core_cstr_copy(d->tools.ytdlp_path, sizeof(d->tools.ytdlp_path), d->tools.ytdlp ? tmp : "yt-dlp");
     d->tools.ffmpeg = find_tool(f ? f : "ffmpeg", tmp, sizeof(tmp));
-    copy_to(d->ffmpeg_path, sizeof(d->ffmpeg_path), d->tools.ffmpeg ? tmp : "ffmpeg");
+    core_cstr_copy(d->ffmpeg_path, sizeof(d->ffmpeg_path), d->tools.ffmpeg ? tmp : "ffmpeg");
 }
 
 static u32 active_count(Downloads *d) {
@@ -695,7 +668,7 @@ static u64 claim_locked(Downloads *d) {
         s->j.progress = 0.02f;
         s->j.error[0] = 0;
         /* stagger starts a little so a big batch doesn't hammer the server */
-        d->next_start_at = now + d->stagger_min + d->stagger_span * (f64)(rng_next(d) % 1000) / 1000.0;
+        d->next_start_at = now + d->stagger_min + d->stagger_span * (f64)(core_rng_next(&d->rng) % 1000) / 1000.0;
         d->version++;
         return s->j.uid;
     }
@@ -730,7 +703,7 @@ static void job_fail(Downloads *d, u64 uid, const char *error) {
     Dl_Slot *s = find_slot(d, uid);
     if (s) {
         s->j.attempts++;
-        copy_to(s->j.error, sizeof(s->j.error), error[0] ? error : "Download failed");
+        core_cstr_copy(s->j.error, sizeof(s->j.error), error[0] ? error : "Download failed");
         s->j.progress = 0;
         s->j.phase = 0;
         if (s->j.attempts >= DL_MAX_ATTEMPTS) {
@@ -755,7 +728,7 @@ static void job_done(Downloads *d, u64 uid, const char *path, b32 existed) {
         s->j.progress = 1;
         s->j.error[0] = 0;
         s->j.existed = (u8)existed;
-        copy_to(s->j.path, sizeof(s->j.path), path);
+        core_cstr_copy(s->j.path, sizeof(s->j.path), path);
         d->finished++;
         d->session_done++;
         save_locked(d);
@@ -782,18 +755,18 @@ static b32 dup_visit(void *user, const char *path, u64 size, s64 mtime_ns) {
     Dup_Probe *pr = user;
     static const char *const exts[] = { ".mp3", ".flac", ".ogg", ".opus", ".m4a" };
     b32 audio = false;
-    for (u32 i = 0; i < CORE_ARRAY_COUNT(exts); i++) audio = audio || ci_suffix(path, exts[i]);
+    for (u32 i = 0; i < CORE_ARRAY_COUNT(exts); i++) audio = audio || core_cstr_ends_ascii_ci(path, exts[i]);
     if (!audio || size == 0) return true;
     const char *name = strrchr(path, '/');
     name = name ? name + 1 : path;
     char base[320];
-    copy_to(base, sizeof(base), name);
+    core_cstr_copy(base, sizeof(base), name);
     char *dot = strrchr(base, '.');
     if (dot) *dot = 0;
     char k[DL_TEXT];
     dl_song_key(base, k, sizeof(k));
     if (strcmp(k, pr->key) != 0) return true;
-    copy_to(pr->found, sizeof(pr->found), path);
+    core_cstr_copy(pr->found, sizeof(pr->found), path);
     return false;
 }
 
@@ -828,8 +801,8 @@ static void artist_folder(const char *music_dir, const char *fallback, const Dl_
                 if (strcmp(k, akey) != 0) continue;
                 char found[1100];
                 snprintf(found, sizeof(found), "%s/%s", gpath, artists[i]);
-                if (is_fallback) copy_to(in_fallback, sizeof(in_fallback), found);
-                else copy_to(dir, cap, found);
+                if (is_fallback) core_cstr_copy(in_fallback, sizeof(in_fallback), found);
+                else core_cstr_copy(dir, cap, found);
                 break;
             }
             /* "Hip-Hop/Rap" lands in a folder called "Hip Hop" (either name may be the longer one) */
@@ -842,8 +815,8 @@ static void artist_folder(const char *music_dir, const char *fallback, const Dl_
         core_arena_release(&a);
     }
     if (dir[0]) { *existing = true; return; }
-    if (in_fallback[0]) { copy_to(dir, cap, in_fallback); *existing = true; return; }
-    if (by_genre[0]) { copy_to(dir, cap, by_genre); return; }
+    if (in_fallback[0]) { core_cstr_copy(dir, cap, in_fallback); *existing = true; return; }
+    if (by_genre[0]) { core_cstr_copy(dir, cap, by_genre); return; }
     snprintf(dir, cap, "%s/%s", fallback, seg);
     *existing = platform_file_info(dir).is_dir;
 }
@@ -863,7 +836,7 @@ static b32 plan_dest(const Dl_Job *j, const char *music_dir, const char *fallbac
     dl_song_key(j->title, pr.key, sizeof(pr.key));
     platform_walk_dir(dir, dup_visit, &pr);
     if (!pr.found[0]) return false;
-    copy_to(dest, cap, pr.found);
+    core_cstr_copy(dest, cap, pr.found);
     return true;
 }
 
@@ -912,7 +885,7 @@ static void take_error_line(const char *line, char *err, u32 cap) {
             m = colon ? colon + 2 : c + 2;
         }
     }
-    copy_to(err, cap, friendly_error(m));
+    core_cstr_copy(err, cap, friendly_error(m));
 }
 
 /* ffmpeg: attach the cover and write every tag. Returns true on success. */
@@ -964,12 +937,12 @@ static b32 tag_file(Downloads *d, const Dl_Job *j, const char *audio, const char
     argv[n] = 0;
 
     Platform_Process *p = platform_process_spawn(argv);
-    if (!p) { copy_to(err, err_cap, "Could not start ffmpeg"); return false; }
+    if (!p) { core_cstr_copy(err, err_cap, "Could not start ffmpeg"); return false; }
     char line[512], last[DL_TEXT] = {0};
     for (;;) {
         s32 r = platform_process_read_line(p, line, sizeof(line), 0.5);
         if (r == -1) break;
-        if (r > 0) copy_to(last, sizeof(last), line);
+        if (r > 0) core_cstr_copy(last, sizeof(last), line);
     }
     s32 code = platform_process_finish(p);
     if (code != 0) {
@@ -988,11 +961,11 @@ static void run_job(Downloads *d, Dl_Worker *w, u64 uid) {
     if (!slot) { platform_mutex_unlock(&d->mu); return; }
     j = slot->j;
     char dest_dir[1024], music_dir[1024];
-    copy_to(dest_dir, sizeof(dest_dir), d->dest_dir);
-    copy_to(music_dir, sizeof(music_dir), d->music_dir);
+    core_cstr_copy(dest_dir, sizeof(dest_dir), d->dest_dir);
+    core_cstr_copy(music_dir, sizeof(music_dir), d->music_dir);
     char ytdlp[512], ffmpeg[512];
-    copy_to(ytdlp, sizeof(ytdlp), d->tools.ytdlp_path);
-    copy_to(ffmpeg, sizeof(ffmpeg), d->ffmpeg_path);
+    core_cstr_copy(ytdlp, sizeof(ytdlp), d->tools.ytdlp_path);
+    core_cstr_copy(ffmpeg, sizeof(ffmpeg), d->ffmpeg_path);
     platform_mutex_unlock(&d->mu);
 
     char work[1100], out_tpl[1200], url[64], audio[1200], cover[1200], part[1700];
@@ -1038,7 +1011,7 @@ static void run_job(Downloads *d, Dl_Worker *w, u64 uid) {
             if (r == -1) break;
             if (r == -2) {
                 if (now_s() - last_output > DL_STALL_SECONDS) {
-                    copy_to(err, sizeof(err), "Timed out");
+                    core_cstr_copy(err, sizeof(err), "Timed out");
                     platform_process_kill(p);
                 }
                 continue;
@@ -1090,7 +1063,7 @@ static void run_job(Downloads *d, Dl_Worker *w, u64 uid) {
     for (u32 i = 0; i < CORE_ARRAY_COUNT(COVER_EXTS); i++) {
         char c[1200];
         snprintf(c, sizeof(c), "%s/%s.%s", work, j.vid, COVER_EXTS[i]);
-        if (platform_file_info(c).exists) { copy_to(cover, sizeof(cover), c); break; }
+        if (platform_file_info(c).exists) { core_cstr_copy(cover, sizeof(cover), c); break; }
     }
     job_progress(d, uid, DL_PHASE_TAG, 0.94f);
     if (plan_dest(&j, music_dir, dest_dir, dest, sizeof(dest))) { /* another job saved it meanwhile */
@@ -1099,7 +1072,7 @@ static void run_job(Downloads *d, Dl_Worker *w, u64 uid) {
         return;
     }
     char dir[1600];
-    copy_to(dir, sizeof(dir), dest);
+    core_cstr_copy(dir, sizeof(dir), dest);
     {
         char *slash = strrchr(dir, '/');
         if (slash) { *slash = 0; platform_make_dirs(dir); }
@@ -1182,7 +1155,7 @@ static u32 search_run(Downloads *d, u32 gen, const char *target, u32 limit, u32 
                       char *err, u32 err_cap) {
     platform_mutex_lock(&d->mu);
     char ytdlp[512];
-    copy_to(ytdlp, sizeof(ytdlp), d->tools.ytdlp_path);
+    core_cstr_copy(ytdlp, sizeof(ytdlp), d->tools.ytdlp_path);
     platform_mutex_unlock(&d->mu);
 
     char end[16];
@@ -1194,7 +1167,7 @@ static u32 search_run(Downloads *d, u32 gen, const char *target, u32 limit, u32 
         target, 0,
     };
     Platform_Process *p = platform_process_spawn(argv);
-    if (!p) { copy_to(err, err_cap, "Could not start yt-dlp"); return 0; }
+    if (!p) { core_cstr_copy(err, err_cap, "Could not start yt-dlp"); return 0; }
 
     platform_mutex_lock(&d->mu);
     d->search_proc = p;
@@ -1209,7 +1182,7 @@ static u32 search_run(Downloads *d, u32 gen, const char *target, u32 limit, u32 
         if (r == -1) break;
         if (r == -2) {
             if (now_s() - last_output > 40.0) {
-                copy_to(err, err_cap, "The search timed out");
+                core_cstr_copy(err, err_cap, "The search timed out");
                 platform_process_kill(p);
             }
             continue;
@@ -1226,7 +1199,7 @@ static u32 search_run(Downloads *d, u32 gen, const char *target, u32 limit, u32 
                 for (u32 i = 0; i < d->sinfo.count && !dup; i++)
                     dup = !strcmp(d->results[i].vid, res.vid) || (dedupe_songs && !strcmp(key, d->keys[i]));
                 if (!dup) {
-                    copy_to(d->keys[d->sinfo.count], DL_TEXT, key);
+                    core_cstr_copy(d->keys[d->sinfo.count], DL_TEXT, key);
                     d->results[d->sinfo.count++] = res;
                     added++;
                 }
@@ -1259,10 +1232,10 @@ static void enrich_music(Downloads *d, u32 gen) {
     char vids[DL_ENRICH_MAX][16];
     u32 n = 0;
     platform_mutex_lock(&d->mu);
-    copy_to(ytdlp, sizeof(ytdlp), d->tools.ytdlp_path);
+    core_cstr_copy(ytdlp, sizeof(ytdlp), d->tools.ytdlp_path);
     if (d->sinfo.generation == gen)
         for (u32 i = 0; i < d->sinfo.count && n < DL_ENRICH_MAX; i++)
-            if (d->results[i].music && !d->results[i].artist[0]) copy_to(vids[n++], sizeof(vids[0]), d->results[i].vid);
+            if (d->results[i].music && !d->results[i].artist[0]) core_cstr_copy(vids[n++], sizeof(vids[0]), d->results[i].vid);
     platform_mutex_unlock(&d->mu);
     if (!n) return;
 
@@ -1307,8 +1280,8 @@ static void enrich_music(Downloads *d, u32 gen) {
                 for (u32 k = 0; k < d->sinfo.count; k++) {
                     Dl_Result *res = &d->results[k];
                     if (strcmp(res->vid, e.vid) != 0) continue;
-                    copy_to(res->artist, sizeof(res->artist), e.artist);
-                    if (e.title[0]) copy_to(res->title, sizeof(res->title), e.title);
+                    core_cstr_copy(res->artist, sizeof(res->artist), e.artist);
+                    if (e.title[0]) core_cstr_copy(res->title, sizeof(res->title), e.title);
                     if (e.duration_s) res->duration_s = e.duration_s;
                     dl_song_key(res->title, d->keys[k], DL_TEXT);
                 }
@@ -1353,7 +1326,7 @@ static void search_main(void *arg) {
         d->search_pending = false;
         u32 gen = d->sinfo.generation, kind = d->search_kind;
         char query[256];
-        copy_to(query, sizeof(query), d->search_query);
+        core_cstr_copy(query, sizeof(query), d->search_query);
         platform_mutex_unlock(&d->mu);
 
         char err[DL_TEXT] = {0};
@@ -1389,7 +1362,7 @@ static void search_main(void *arg) {
                 char err2[DL_TEXT] = {0};
                 snprintf(target, sizeof(target), "ytsearch12:%s", query);
                 found += search_run(d, gen, target, 12, 12, false, false, err2, sizeof(err2));
-                if (!found) copy_to(err, sizeof(err), err2);
+                if (!found) core_cstr_copy(err, sizeof(err), err2);
                 enrich_music(d, gen);
             }
         }
@@ -1397,7 +1370,7 @@ static void search_main(void *arg) {
         platform_mutex_lock(&d->mu);
         if (d->sinfo.generation == gen) {
             d->sinfo.state = found ? DL_SEARCH_DONE : DL_SEARCH_FAILED;
-            if (!found) copy_to(d->sinfo.error, sizeof(d->sinfo.error), err[0] ? err : "No results");
+            if (!found) core_cstr_copy(d->sinfo.error, sizeof(d->sinfo.error), err[0] ? err : "No results");
         }
     }
     platform_mutex_unlock(&d->mu);
@@ -1413,8 +1386,8 @@ Downloads *downloads_create(const char *state_path, const char *work_dir) {
     Downloads *d = core_heap_calloc(sizeof(*d));
     platform_mutex_init(&d->mu);
     platform_cond_init(&d->cv);
-    copy_to(d->state_path, sizeof(d->state_path), state_path);
-    copy_to(d->work_dir, sizeof(d->work_dir), work_dir);
+    core_cstr_copy(d->state_path, sizeof(d->state_path), state_path);
+    core_cstr_copy(d->work_dir, sizeof(d->work_dir), work_dir);
     d->parallel = 2;
     d->next_uid = 1;
     d->rng = 0x9e3779b9u ^ (u32)(now_s() * 1000.0);
@@ -1483,7 +1456,7 @@ void downloads_destroy(Downloads *d) {
 
 void downloads_configure(Downloads *d, const char *dest_dir, u32 parallel) {
     platform_mutex_lock(&d->mu);
-    copy_to(d->dest_dir, sizeof(d->dest_dir), dest_dir);
+    core_cstr_copy(d->dest_dir, sizeof(d->dest_dir), dest_dir);
     d->parallel = CORE_CLAMP(parallel, 1u, (u32)DL_MAX_WORKERS);
     platform_mutex_unlock(&d->mu);
     platform_cond_broadcast(&d->cv);
@@ -1509,7 +1482,7 @@ static void sweep_work_dir(Downloads *d) {
             memcpy(part, note.str, len);
             part[len] = 0;
             part[strcspn(part, "\r\n")] = 0;
-            if (ci_suffix(part, ".mp3.part")) {
+            if (core_cstr_ends_ascii_ci(part, ".mp3.part")) {
                 platform_file_remove(part);
                 char *slash = strrchr(part, '/');
                 if (slash) { *slash = 0; platform_remove_dir_if_empty(part); }
@@ -1526,7 +1499,7 @@ static void sweep_work_dir(Downloads *d) {
 
 void downloads_set_library(Downloads *d, const char *music_dir) {
     platform_mutex_lock(&d->mu);
-    copy_to(d->music_dir, sizeof(d->music_dir), music_dir);
+    core_cstr_copy(d->music_dir, sizeof(d->music_dir), music_dir);
     platform_mutex_unlock(&d->mu);
 }
 
@@ -1551,14 +1524,14 @@ void downloads_search(Downloads *d, u32 kind, const char *query) {
     d->sinfo.kind = kind;
     d->sinfo.count = 0;
     d->sinfo.error[0] = 0;
-    copy_to(d->sinfo.query, sizeof(d->sinfo.query), query);
+    core_cstr_copy(d->sinfo.query, sizeof(d->sinfo.query), query);
     d->sinfo.state = DL_SEARCH_BUSY;
     if (!d->tools.ytdlp) {
         d->sinfo.state = DL_SEARCH_FAILED;
-        copy_to(d->sinfo.error, sizeof(d->sinfo.error), "yt-dlp is not installed");
+        core_cstr_copy(d->sinfo.error, sizeof(d->sinfo.error), "yt-dlp is not installed");
     } else {
         d->search_kind = kind;
-        copy_to(d->search_query, sizeof(d->search_query), query);
+        core_cstr_copy(d->search_query, sizeof(d->search_query), query);
         d->search_pending = true;
         if (d->search_proc) platform_process_kill(d->search_proc);
         kill_enrich_locked(d);
@@ -1646,7 +1619,7 @@ u32 downloads_enqueue(Downloads *d, const Dl_Result *results, u32 count, const c
         }
         char artist[DL_TEXT], title[DL_TEXT];
         if (artist_hint && artist_hint[0]) dl_primary_artist(artist_hint, artist, sizeof(artist));
-        else if (r->artist[0]) copy_to(artist, sizeof(artist), r->artist);
+        else if (r->artist[0]) core_cstr_copy(artist, sizeof(artist), r->artist);
         else dl_clean_channel(r->channel, artist, sizeof(artist));
         dl_clean_title(r->title, artist, title, sizeof(title));
         if (song_in_queue(d, artist, title)) continue; /* "Hypnotize" and "Hypnotize (2007 Remaster)" */
@@ -1660,8 +1633,8 @@ u32 downloads_enqueue(Downloads *d, const Dl_Result *results, u32 count, const c
         Dl_Job *j = &s->j;
         j->uid = d->next_uid++;
         memcpy(j->vid, r->vid, 12);
-        copy_to(j->artist, sizeof(j->artist), artist);
-        copy_to(j->title, sizeof(j->title), title);
+        core_cstr_copy(j->artist, sizeof(j->artist), artist);
+        core_cstr_copy(j->title, sizeof(j->title), title);
         j->duration_s = r->duration_s;
         added++;
     }

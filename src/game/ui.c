@@ -1,4 +1,6 @@
 #include "ui.h"
+#include "../core/random.h"
+#include "../core/hash.h"
 
 #include <math.h>
 #include <string.h>
@@ -18,16 +20,20 @@ const vec4 UI_LINE          = UI_RGBA_C(255, 255, 255, 0.07f);
 vec4 ui_alpha(vec4 c, f32 a) { c.a *= a; return c; }
 vec4 ui_rgb(vec3 c, f32 a) { return (vec4){ .x = c.x, .y = c.y, .z = c.z, .w = a }; }
 vec4 ui_mix(vec4 a, vec4 b, f32 t) {
-    return (vec4){ .x = core_lerp(a.x, b.x, t), .y = core_lerp(a.y, b.y, t),
-                   .z = core_lerp(a.z, b.z, t), .w = core_lerp(a.w, b.w, t) };
+    return vec4_lerp(a, b, t);
+}
+vec4 game_ui_hash_color(u64 h, f32 a) {
+    f32 hue = (f32)(h % 360) / 360.0f;
+    f32 r = 0.5f + 0.5f * cosf(CORE_TAU * (hue + 0.0f));
+    f32 g = 0.5f + 0.5f * cosf(CORE_TAU * (hue + 0.33f));
+    f32 b = 0.5f + 0.5f * cosf(CORE_TAU * (hue + 0.67f));
+    return (vec4){ .x = 0.18f + r * 0.28f, .y = 0.12f + g * 0.2f, .z = 0.3f + b * 0.3f, .w = a };
 }
 
 /* ---- ids ---- */
 
 u64 ui_id(const char *name) {
-    u64 h = 0xcbf29ce484222325ULL;
-    for (const u8 *p = (const u8 *)name; *p; p++) { h ^= *p; h *= 0x100000001b3ULL; }
-    return h | 1;
+    return core_hash_cstr(name) | 1;
 }
 
 u64 ui_idx(u64 base, u64 index) {
@@ -244,20 +250,17 @@ void ui_ripple(Ui *ui, vec2 center, f32 radius, vec4 color, vec2 clip_pos, vec2 
 }
 
 static u32 g_rng = 0x12345678u;
-static f32 frand(void) {
-    g_rng ^= g_rng << 13; g_rng ^= g_rng >> 17; g_rng ^= g_rng << 5;
-    return (f32)(g_rng & 0xFFFFFF) / (f32)0x1000000;
-}
+
 
 void ui_burst(Ui *ui, vec2 center, u32 count, vec4 color, u32 shape, f32 speed) {
     for (u32 i = 0; i < count && ui->particle_count < UI_MAX_PARTICLES; i++) {
-        f32 ang = ((f32)i / (f32)count) * CORE_TAU + frand() * 0.6f;
-        f32 sp = speed * (0.6f + frand() * 0.7f);
+        f32 ang = ((f32)i / (f32)count) * CORE_TAU + core_rng_f32(&g_rng) * 0.6f;
+        f32 sp = speed * (0.6f + core_rng_f32(&g_rng) * 0.7f);
         Ui_Particle p = {
             .pos = center,
             .vel = vec2_make(cosf(ang) * sp, sinf(ang) * sp - speed * 0.25f),
-            .life = 0.5f + frand() * 0.4f,
-            .size = (shape == 1 ? 5.0f : 2.2f) * (0.7f + frand() * 0.6f) * ui->scale,
+            .life = 0.5f + core_rng_f32(&g_rng) * 0.4f,
+            .size = (shape == 1 ? 5.0f : 2.2f) * (0.7f + core_rng_f32(&g_rng) * 0.6f) * ui->scale,
             .color = color,
             .shape = shape,
         };

@@ -1,4 +1,5 @@
 #include "font.h"
+#include "hash.h"
 
 #include "third_party/stb_truetype.h"
 
@@ -101,7 +102,7 @@ Core_Font core_text_font(Core_Text *t, const char *const *paths, u32 count) {
             if (strcmp(t->faces[fi].path, paths[i]) == 0) break;
         if (fi == t->face_count) {
             if (t->face_count == MAX_FACES) break;
-            snprintf(t->faces[fi].path, sizeof(t->faces[fi].path), "%s", paths[i]);
+            core_cstr_copy(t->faces[fi].path, sizeof(t->faces[fi].path), paths[i]);
             t->face_count++;
         }
         t->chains[id][n++] = (u8)fi;
@@ -167,12 +168,7 @@ static b32 atlas_alloc(Core_Text *t, u32 w, u32 h, u16 *ox, u16 *oy) {
     return true;
 }
 
-CORE_INLINE u64 hash_u64(u64 x) {
-    x ^= x >> 33; x *= 0xff51afd7ed558ccdULL;
-    x ^= x >> 33; x *= 0xc4ceb9fe1a85ec53ULL;
-    x ^= x >> 33;
-    return x;
-}
+
 
 static f32 face_scale(Face *f, f32 px) {
     return stbtt_ScaleForMappingEmToPixels(&f->info, px);
@@ -183,7 +179,7 @@ static f32 face_scale(Face *f, f32 px) {
 static Glyph *glyph_get(Core_Text *t, Core_Font f, u32 cp, u32 ipx, u32 sub) {
     u64 key = ((u64)cp) | ((u64)sub << 21) | ((u64)ipx << 24) | ((u64)f.id << 40) | (1ULL << 63);
     u32 mask = GLYPH_CAP - 1;
-    u32 i = (u32)hash_u64(key) & mask;
+    u32 i = (u32)core_hash_u64(key) & mask;
     for (;;) {
         Glyph *g = &t->glyphs[i];
         if (g->key == key) return g;
@@ -254,7 +250,7 @@ static f32 kern_get(Core_Text *t, const Glyph *a, const Glyph *b, u32 ipx) {
     if (a->face != b->face) return 0;
     u64 key = ((u64)a->glyph) | ((u64)b->glyph << 16) | ((u64)a->face << 32) | ((u64)ipx << 40) | (1ULL << 63);
     u32 mask = KERN_CAP - 1;
-    u32 i = (u32)hash_u64(key) & mask;
+    u32 i = (u32)core_hash_u64(key) & mask;
     for (u32 probe = 0; probe < 8; probe++) {
         Kern *k = &t->kerns[i];
         if (k->key == key) return k->value;
@@ -367,9 +363,7 @@ f32 core_text_draw_fit(Core_Text *t, Core_Font f, Core_String s, vec2 pos, f32 p
     u64 cut = layout(t, f, s, vec2_zero(), px, (vec4){0}, false, room, &w);
     Core_String prefix = core_str_prefix(s, cut);
     while (prefix.len && core_text_measure(t, f, prefix, px) > room) {
-        u64 n = prefix.len - 1;
-        while (n > 0 && (prefix.str[n] & 0xC0) == 0x80) n--;
-        prefix.len = n;
+        prefix.len = core_utf8_prev(prefix, prefix.len);
     }
     while (prefix.len && (prefix.str[prefix.len - 1] == ' ' || prefix.str[prefix.len - 1] == '-'))
         prefix.len--;

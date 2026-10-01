@@ -1,11 +1,5 @@
 #include "filter.h"
-#include "search.h"
 #include <string.h>
-
-static u32 game_filter_fold(u32 cp) {
-    u8 latin = search_fold(cp);
-    return latin == 0xFF ? cp : latin;
-}
 
 void game_filter_compile(Game_Filter *filter, Core_String query) {
     memset(filter, 0, sizeof(*filter));
@@ -22,7 +16,7 @@ void game_filter_compile(Game_Filter *filter, Core_String query) {
         }
         u32 word = filter->word_count - 1, start = filter->start[word];
         u32 length = filter->length[word];
-        filter->text[n] = game_filter_fold(d.codepoint);
+        filter->text[n] = core_unicode_fold_latin(d.codepoint);
         if (length) {
             u32 j = filter->fallback[n - 1];
             while (j && filter->text[start + j] != filter->text[n]) j = filter->fallback[start + j - 1];
@@ -53,7 +47,7 @@ s32 game_filter_score_word(const Game_Filter *filter, u32 word, Core_String text
     for (u64 at = 0; at < text.len; i++) {
         Core_Utf8Decode d = core_utf8_decode(text, at);
         at += d.size;
-        u32 cp = game_filter_fold(d.codepoint);
+        u32 cp = core_unicode_fold_latin(d.codepoint);
         b32 boundary = i == 0 || !game_filter_word_char(previous);
         word_start[i % length] = boundary;
         previous = cp;

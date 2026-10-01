@@ -102,6 +102,8 @@ extern const vec4 UI_LINE;
 vec4 ui_alpha(vec4 c, f32 a);                 /* multiply alpha        */
 vec4 ui_mix(vec4 a, vec4 b, f32 t);
 vec4 ui_rgb(vec3 c, f32 a);
+/* Deterministic violet placeholder color for artwork missing from either view. */
+vec4 game_ui_hash_color(u64 hash, f32 alpha);
 
 /* ---- frame ---- */
 

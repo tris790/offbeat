@@ -29,6 +29,12 @@ int main(void)
     TEST_CHECK(near(vec3_length(vec3_make(3, 4, 0)), 5));
     TEST_CHECK(near(core_wrap(-0.25f, 1.0f), 0.75f));
     TEST_CHECK(near(core_radians(180.0f), CORE_PI));
+    TEST_CHECK(near(core_saturate(-1), 0) && near(core_saturate(2), 1));
+    TEST_CHECK(near(core_saturate(0.4f), 0.4f));
+    TEST_CHECK(isnan(core_saturate(NAN)));
+    TEST_CHECK(near(core_ease_out_cubic(-0.5f), 0));
+    TEST_CHECK(near(core_ease_out_cubic(0.5f), 0.875f));
+    TEST_CHECK(near(core_ease_out_cubic(1.5f), 1));
 
     vec3 rotated = quat_rotate_vec3(quat_from_axis_angle(vec3_make(0, 0, 1), CORE_PI * 0.5f), vec3_make(1, 0, 0));
     TEST_CHECK(vec3_near(rotated, vec3_make(0, 1, 0)));
@@ -54,9 +60,29 @@ int main(void)
 
     vec3 red = core_hsv_to_rgb(0.0f, 1.0f, 1.0f);
     TEST_CHECK(vec3_near(red, vec3_make(1, 0, 0)));
+    TEST_CHECK(vec3_near(core_hsv_to_rgb(-0.25f, 0.7f, 0.8f), core_hsv_to_rgb(0.75f, 0.7f, 0.8f)));
+    TEST_CHECK(vec3_near(core_hsv_to_rgb(2.25f, 0.7f, 0.8f), core_hsv_to_rgb(0.25f, 0.7f, 0.8f)));
+    TEST_CHECK(vec3_near(core_rgb_to_hsv(vec3_zero()), vec3_zero()));
+    TEST_CHECK(vec3_near(core_rgb_to_hsv(vec3_make(0.4f, 0.4f, 0.4f)), vec3_make(0, 0, 0.4f)));
+    TEST_CHECK(vec3_near(core_rgb_to_hsv(vec3_make(1, 0, 1)), vec3_make(5.0f / 6.0f, 1, 1)));
+    /* Cover palettes use all hue branches and non-primary RGB components. */
+    const vec3 colors[] = {
+        {{1, 0, 0}}, {{0, 1, 0}}, {{0, 0, 1}}, {{0.2f, 0.7f, 0.5f}},
+        {{0.8f, 0.1f, 0.6f}}, {{0.3f, 0.2f, 0.9f}},
+    };
+    for (u32 i = 0; i < CORE_ARRAY_COUNT(colors); i++) {
+        vec3 hsv = core_rgb_to_hsv(colors[i]);
+        TEST_CHECK(vec3_near(core_hsv_to_rgb(hsv.x, hsv.y, hsv.z), colors[i]));
+    }
+    TEST_CHECK(near(core_rgb_luma(vec3_one()), 1));
+    TEST_CHECK(near(core_rgb_luma(vec3_make(0, 1, 0)), 0.7152f));
+    /* An asymmetric matrix catches row/column-order swaps; extremes exercise
+       the clamping shared by CPU scene colors and renderer instance colors. */
+    const f32 color_matrix[9] = { 0, 2, 0, 0, 0, 0.5f, -1, 0, 0 };
+    TEST_CHECK(vec3_near(core_color_matrix_apply(color_matrix, vec3_make(0.2f, 0.7f, 0.8f)),
+                        vec3_make(1, 0.4f, 0)));
     TEST_CHECK(vec4_near(core_hex(0x3366CCFF), vec4_make(0x33 / 255.0f, 0x66 / 255.0f, 0xCC / 255.0f, 1.0f)));
 
     puts("math tests passed");
     return 0;
 }
-

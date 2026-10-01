@@ -53,6 +53,12 @@ CORE_INLINE f32 core_f32_max(f32 a, f32 b) { return a > b ? a : b; }
 CORE_INLINE f32 core_f32_clamp(f32 x, f32 lo, f32 hi) {
     return core_f32_min(core_f32_max(x, lo), hi);
 }
+/* Clamp a normalized value; NaN propagates like the original UI helpers. */
+CORE_INLINE f32 core_saturate(f32 x) { return x < 0 ? 0 : (x > 1 ? 1 : x); }
+CORE_INLINE f32 core_ease_out_cubic(f32 t) {
+    f32 u = 1.0f - core_saturate(t);
+    return 1.0f - u * u * u;
+}
 CORE_INLINE f32 core_f32_abs(f32 x) { return x < 0.0f ? -x : x; }
 CORE_INLINE b32 core_f32_near(f32 a, f32 b, f32 epsilon) {
     return core_f32_abs(a - b) <= epsilon;
@@ -285,8 +291,36 @@ CORE_INLINE vec4 core_hex(u32 hex) {
     return vec4_make(((hex >> 24) & 0xFF) / 255.0f, ((hex >> 16) & 0xFF) / 255.0f,
                      ((hex >> 8) & 0xFF) / 255.0f, (hex & 0xFF) / 255.0f);
 }
+/* Hue in turns, saturation/value in 0..1. Achromatic colors have hue 0. */
+CORE_INLINE vec3 core_rgb_to_hsv(vec3 c) {
+    f32 mx = CORE_MAX(c.r, CORE_MAX(c.g, c.b));
+    f32 mn = CORE_MIN(c.r, CORE_MIN(c.g, c.b)), d = mx - mn;
+    f32 s = mx > 0 ? d / mx : 0;
+    if (d <= 0) return vec3_make(0, s, mx);
+    f32 h;
+    if (mx == c.r)      h = (c.g - c.b) / d;
+    else if (mx == c.g) h = 2 + (c.b - c.r) / d;
+    else               h = 4 + (c.r - c.g) / d;
+    h /= 6;
+    return vec3_make(h < 0 ? h + 1 : h, s, mx);
+}
+/* Rec.709 weighted RGB brightness. Physical luminance requires linear RGB;
+   this helper does not convert the supplied color's transfer function. */
+CORE_INLINE f32 core_rgb_luma(vec3 c) {
+    return 0.2126f * c.r + 0.7152f * c.g + 0.0722f * c.b;
+}
+/* Row-major color matrix (unlike mat4), with output clamped to display RGB. */
+CORE_INLINE vec3 core_color_matrix_apply(const f32 m[9], vec3 c) {
+    vec3 o = vec3_make(m[0] * c.r + m[1] * c.g + m[2] * c.b,
+                      m[3] * c.r + m[4] * c.g + m[5] * c.b,
+                      m[6] * c.r + m[7] * c.g + m[8] * c.b);
+    o.r = CORE_CLAMP(o.r, 0.0f, 1.0f);
+    o.g = CORE_CLAMP(o.g, 0.0f, 1.0f);
+    o.b = CORE_CLAMP(o.b, 0.0f, 1.0f);
+    return o;
+}
 CORE_INLINE vec3 core_hsv_to_rgb(f32 h, f32 s, f32 v) {
-    h = core_wrap(h, 1.0f);
+    h -= floorf(h);
     f32 scaled = h * 6.0f, i = floorf(scaled), f = scaled - i;
     f32 p = v * (1.0f - s), q = v * (1.0f - f * s), t = v * (1.0f - (1.0f - f) * s);
     switch ((int)i % 6) {
@@ -300,4 +334,3 @@ CORE_INLINE vec3 core_hsv_to_rgb(f32 h, f32 s, f32 v) {
 }
 
 #endif /* CORE_MATH_H */
-

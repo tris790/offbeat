@@ -20,6 +20,8 @@
  */
 
 #include "covers.h"
+#include "../core/image.h"
+#include "../core/hash.h"
 #include "../platform/platform.h"
 #include "../third_party/stb_image.h"
 #include "../third_party/stb_image_write.h"
@@ -86,13 +88,12 @@ typedef struct Cov_Worker {
     u8               thumb[COV_THUMB_BYTES];
     u8               stream_buf[COV_STREAM_BUF];
     /* resampler scratch (sized for the largest output) */
-    f32              acc[COVER_ART_SIZE * 4];
-    u32              xi0[COVER_ART_SIZE], xi1[COVER_ART_SIZE];
-    f32              xw0[COVER_ART_SIZE], xw1[COVER_ART_SIZE], xsum[COVER_ART_SIZE];
+    _Alignas(f32) u8 image_scratch[COVER_ART_SIZE * CORE_IMAGE_SCRATCH_PER_PIXEL];
 } Cov_Worker;
 
 struct Covers {
     Core_Renderer *r;
+    Core_ImageColorTables color_tables;
     char           thumbs_dir[COV_PATH_MAX];
     Core_Texture   atlas;
     Core_Texture   art_tex[2];
@@ -143,43 +144,13 @@ struct Covers {
     u32            worker_count;
 };
 
-/* ---- color tables (built once, read-only afterwards) ---- */
-
-static f32 g_cov_srgb_to_lin[256];
-static u8  g_cov_lin_to_srgb[4096];
-static b32 g_cov_tables_ready;
-
-static void cov_init_tables(void) {
-    if (g_cov_tables_ready) return;
-    for (u32 i = 0; i < 256; i++) {
-        f32 v = i / 255.0f;
-        g_cov_srgb_to_lin[i] = v <= 0.04045f ? v / 12.92f : powf((v + 0.055f) / 1.055f, 2.4f);
-    }
-    for (u32 i = 0; i < 4096; i++) {
-        f32 v = i / 4095.0f;
-        f32 s = v <= 0.0031308f ? v * 12.92f : 1.055f * powf(v, 1.0f / 2.4f) - 0.055f;
-        g_cov_lin_to_srgb[i] = (u8)CORE_CLAMP((s32)(s * 255.0f + 0.5f), 0, 255);
-    }
-    g_cov_tables_ready = true;
-}
-
-static u8 cov_to_srgb(f32 lin) {
-    s32 i = (s32)(lin * 4095.0f + 0.5f);
-    return g_cov_lin_to_srgb[CORE_CLAMP(i, 0, 4095)];
-}
-
 /* ---- keys & paths ---- */
 
-static u64 cov_mix(u64 x) {
-    x ^= x >> 30; x *= 0xbf58476d1ce4e5b9ull;
-    x ^= x >> 27; x *= 0x94d049bb133111ebull;
-    x ^= x >> 31;
-    return x;
-}
+
 
 static u64 cov_key(const Lib_Track *t) {
-    return cov_mix(t->path_hash ^ cov_mix(t->file_size + 0x9E3779B97F4A7C15ull) ^
-                   cov_mix((u64)t->mtime_ns * 0x2545F4914F6CDD1Dull));
+    return core_mix_u64(t->path_hash ^ core_mix_u64(t->file_size + 0x9E3779B97F4A7C15ull) ^
+                   core_mix_u64((u64)t->mtime_ns * 0x2545F4914F6CDD1Dull));
 }
 
 static void cov_cache_path(Covers *c, char *out, u64 key, const char *suffix) {
@@ -305,136 +276,16 @@ static u8 *cov_decode_file(Covers *c, Cov_Worker *w, const char *path, u64 start
     return pixels;
 }
 
-/* ---- resampling ----
-   Center-crop to a square, then either area-average (downscale: every
-   source pixel contributes with its exact coverage) or bilinear (upscale).
-   Color is averaged in linear light, alpha linearly. Output is RGBA8. */
-
-static void cov_fetch(const u8 *p, u32 ch, f32 *o) {
-    if (ch >= 3) {
-        o[0] = g_cov_srgb_to_lin[p[0]]; o[1] = g_cov_srgb_to_lin[p[1]]; o[2] = g_cov_srgb_to_lin[p[2]];
-        o[3] = ch == 4 ? p[3] * (1.0f / 255.0f) : 1.0f;
-    } else {
-        o[0] = o[1] = o[2] = g_cov_srgb_to_lin[p[0]];
-        o[3] = ch == 2 ? p[1] * (1.0f / 255.0f) : 1.0f;
-    }
-}
-
-static void cov_store(u8 *d, const f32 *v, f32 norm) {
-    d[0] = cov_to_srgb(v[0] * norm);
-    d[1] = cov_to_srgb(v[1] * norm);
-    d[2] = cov_to_srgb(v[2] * norm);
-    d[3] = (u8)CORE_CLAMP((s32)(v[3] * norm * 255.0f + 0.5f), 0, 255);
-}
-
-static void cov_resample(Cov_Worker *w, const u8 *src, u32 sw, u32 sh, u32 ch, u8 *dst, u32 size) {
-    u32 side = CORE_MIN(sw, sh);
-    f64 cx = (sw - side) / 2, cy = (sh - side) / 2;
-    f64 scale = (f64)side / size;
-    f32 px[4];
-
-    if (scale < 1.0) {
-        for (u32 oy = 0; oy < size; oy++) {
-            f64 fy = CORE_CLAMP(cy + (oy + 0.5) * scale - 0.5, cy, cy + side - 1);
-            u32 y0 = (u32)fy, y1 = CORE_MIN(y0 + 1, (u32)(cy + side - 1));
-            f32 ty = (f32)(fy - y0);
-            for (u32 ox = 0; ox < size; ox++) {
-                f64 fx = CORE_CLAMP(cx + (ox + 0.5) * scale - 0.5, cx, cx + side - 1);
-                u32 x0 = (u32)fx, x1 = CORE_MIN(x0 + 1, (u32)(cx + side - 1));
-                f32 tx = (f32)(fx - x0), v[4] = {0}, a[4], b[4], cc[4], d[4];
-                cov_fetch(src + ((u64)y0 * sw + x0) * ch, ch, a);
-                cov_fetch(src + ((u64)y0 * sw + x1) * ch, ch, b);
-                cov_fetch(src + ((u64)y1 * sw + x0) * ch, ch, cc);
-                cov_fetch(src + ((u64)y1 * sw + x1) * ch, ch, d);
-                for (u32 k = 0; k < 4; k++)
-                    v[k] = (a[k] * (1 - tx) + b[k] * tx) * (1 - ty) + (cc[k] * (1 - tx) + d[k] * tx) * ty;
-                cov_store(dst + ((u64)oy * size + ox) * 4, v, 1.0f);
-            }
-        }
-        return;
-    }
-
-    for (u32 ox = 0; ox < size; ox++) {
-        f64 x0 = cx + ox * scale, x1 = x0 + scale;
-        u32 i0 = (u32)x0, i1 = (u32)x1;
-        if ((f64)i1 >= x1) i1--;                  /* x1 exactly on a pixel edge */
-        i1 = CORE_MIN(i1, sw - 1);
-        w->xi0[ox] = i0;
-        w->xi1[ox] = i1;
-        if (i0 == i1) { w->xw0[ox] = (f32)(x1 - x0); w->xw1[ox] = 0; }
-        else          { w->xw0[ox] = (f32)(i0 + 1 - x0); w->xw1[ox] = (f32)CORE_MIN(x1 - i1, 1.0); }
-        w->xsum[ox] = w->xw0[ox] + w->xw1[ox] + (i1 > i0 ? (f32)(i1 - i0 - 1) : 0);
-    }
-
-    for (u32 oy = 0; oy < size; oy++) {
-        f64 y0 = cy + oy * scale, y1 = y0 + scale;
-        u32 j0 = (u32)y0, j1 = (u32)y1;
-        if ((f64)j1 >= y1) j1--;
-        j1 = CORE_MIN(j1, sh - 1);
-        memset(w->acc, 0, sizeof(f32) * 4 * size);
-        f32 wsum = 0;
-        for (u32 sy = j0; sy <= j1; sy++) {
-            f32 wy = (f32)(CORE_MIN(sy + 1.0, y1) - CORE_MAX((f64)sy, y0));
-            if (wy <= 0) continue;
-            wsum += wy;
-            const u8 *row = src + (u64)sy * sw * ch;
-            for (u32 ox = 0; ox < size; ox++) {
-                u32 i0 = w->xi0[ox], i1 = w->xi1[ox];
-                f32 s[4] = {0};
-                for (u32 sx = i0; sx <= i1; sx++) {
-                    f32 wx = sx == i0 ? w->xw0[ox] : (sx == i1 ? w->xw1[ox] : 1.0f);
-                    cov_fetch(row + (u64)sx * ch, ch, px);
-                    s[0] += px[0] * wx; s[1] += px[1] * wx; s[2] += px[2] * wx; s[3] += px[3] * wx;
-                }
-                f32 *acc = w->acc + ox * 4;
-                acc[0] += s[0] * wy; acc[1] += s[1] * wy; acc[2] += s[2] * wy; acc[3] += s[3] * wy;
-            }
-        }
-        for (u32 ox = 0; ox < size; ox++) {
-            f32 norm = 1.0f / CORE_MAX(wsum * w->xsum[ox], 1e-6f);
-            cov_store(dst + ((u64)oy * size + ox) * 4, w->acc + ox * 4, norm);
-        }
-    }
-}
-
 /* ---- palette ---- */
 
-static void cov_rgb_to_hsv(vec3 c, f32 *h, f32 *s, f32 *v) {
-    f32 mx = CORE_MAX(c.r, CORE_MAX(c.g, c.b)), mn = CORE_MIN(c.r, CORE_MIN(c.g, c.b)), d = mx - mn;
-    *v = mx;
-    *s = mx > 0 ? d / mx : 0;
-    if (d <= 0) { *h = 0; return; }
-    f32 hh;
-    if (mx == c.r)      hh = (c.g - c.b) / d;
-    else if (mx == c.g) hh = 2 + (c.b - c.r) / d;
-    else                hh = 4 + (c.r - c.g) / d;
-    hh /= 6;
-    *h = hh < 0 ? hh + 1 : hh;
-}
-
-static vec3 cov_hsv_to_rgb(f32 h, f32 s, f32 v) {
-    f32 hh = (h - floorf(h)) * 6;
-    s32 i = (s32)hh;
-    f32 f = hh - i, p = v * (1 - s), q = v * (1 - s * f), t = v * (1 - s * (1 - f));
-    switch (i % 6) {
-        case 0:  return vec3_make(v, t, p);
-        case 1:  return vec3_make(q, v, p);
-        case 2:  return vec3_make(p, v, t);
-        case 3:  return vec3_make(p, q, v);
-        case 4:  return vec3_make(t, p, v);
-        default: return vec3_make(v, p, q);
-    }
-}
-
-static f32 cov_luma(vec3 c) { return 0.2126f * c.r + 0.7152f * c.g + 0.0722f * c.b; }
 
 /* Deterministic per-track fallback palette (no art). */
 static void cov_default_palette(u64 hash, vec3 out[4]) {
-    f32 h = (f32)(cov_mix(hash) % 360) / 360.0f;
-    out[0] = cov_hsv_to_rgb(h, 0.35f, 0.10f);
-    out[1] = cov_hsv_to_rgb(h, 0.30f, 0.22f);
-    out[2] = cov_hsv_to_rgb(h, 0.25f, 0.45f);
-    out[3] = cov_hsv_to_rgb(h, 0.60f, 0.95f);
+    f32 h = (f32)(core_mix_u64(hash) % 360) / 360.0f;
+    out[0] = core_hsv_to_rgb(h, 0.35f, 0.10f);
+    out[1] = core_hsv_to_rgb(h, 0.30f, 0.22f);
+    out[2] = core_hsv_to_rgb(h, 0.25f, 0.45f);
+    out[3] = core_hsv_to_rgb(h, 0.60f, 0.95f);
 }
 
 /* k-means (k = 5, farthest-point init) on a 32x32 downsample.
@@ -500,16 +351,15 @@ static void cov_palette(const u8 *rgba, u32 size, vec3 out[4]) {
     for (u32 k = 1; k < K; k++) if (count[k] > count[biggest]) biggest = k;
     u32 dark = biggest;
     for (u32 k = 0; k < K; k++)
-        if (count[k] >= SAMPLES * 15 / 100 && cov_luma(ctr[k]) < cov_luma(ctr[dark])) dark = k;
+        if (count[k] >= SAMPLES * 15 / 100 && core_rgb_luma(ctr[k]) < core_rgb_luma(ctr[dark])) dark = k;
 
     /* [3]: most vibrant; tiny clusters are discounted so specks don't win. */
     u32 vib = dark == 0 ? 1 : 0;
     f32 best = -1;
     for (u32 k = 0; k < K; k++) {
         if (k == dark || !count[k]) continue;
-        f32 h, s, v;
-        cov_rgb_to_hsv(ctr[k], &h, &s, &v);
-        f32 score = s * v * (count[k] >= SAMPLES / 50 ? 1.0f : 0.3f);
+        vec3 hsv = core_rgb_to_hsv(ctr[k]);
+        f32 score = hsv.y * hsv.z * (count[k] >= SAMPLES / 50 ? 1.0f : 0.3f);
         if (score > best) { best = score; vib = k; }
     }
 
@@ -527,15 +377,15 @@ static void cov_palette(const u8 *rgba, u32 size, vec3 out[4]) {
     out[0] = ctr[dark];
     vec3 m1 = rc > 0 ? ctr[rest[0]] : vec3_lerp(ctr[dark], ctr[vib], 0.33f);
     vec3 m2 = rc > 1 ? ctr[rest[1]] : vec3_lerp(ctr[dark], ctr[vib], 0.66f);
-    if (cov_luma(m1) > cov_luma(m2)) { vec3 t = m1; m1 = m2; m2 = t; }
+    if (core_rgb_luma(m1) > core_rgb_luma(m2)) { vec3 t = m1; m1 = m2; m2 = t; }
     out[1] = m1;
     out[2] = m2;
 
-    f32 h, s, v;
-    cov_rgb_to_hsv(ctr[vib], &h, &s, &v);
+    vec3 hsv = core_rgb_to_hsv(ctr[vib]);
+    f32 h = hsv.x, s = hsv.y, v = hsv.z;
     if (s >= 0.12f) s = CORE_MAX(s, 0.55f); /* keep grayscale art gray */
     v = CORE_MAX(v, 0.85f);
-    out[3] = cov_hsv_to_rgb(h, CORE_MIN(s, 1.0f), CORE_MIN(v, 1.0f));
+    out[3] = core_hsv_to_rgb(h, CORE_MIN(s, 1.0f), CORE_MIN(v, 1.0f));
 }
 
 /* ---- disk cache ---- */
@@ -613,7 +463,7 @@ static u32 cov_generate(Covers *c, Cov_Worker *w, const Cov_Job *job, u8 *out, u
         }
     }
     if (!img) return COV_NO_ART;
-    cov_resample(w, img, (u32)iw, (u32)ih, (u32)ich, out, size);
+    core_image_resize_square(&w->c->color_tables, img, (u32)iw, (u32)ih, (u32)ich, out, size, w->image_scratch, COVER_ART_SIZE);
     stbi_image_free(img);
     cov_budget_release(c, reserved);
     return COV_OK;
@@ -677,7 +527,7 @@ static void cov_run_art(Covers *c, Cov_Worker *w, const Cov_Job *job) {
             if (!missing) {
                 cov_write_jpg(c, path, px, COVER_ART_SIZE);
                 if (!ti.exists) { /* the thumbnail is a free 8x8 box filter away */
-                    cov_resample(w, px, COVER_ART_SIZE, COVER_ART_SIZE, 4, w->thumb, COVER_THUMB_SIZE);
+                    core_image_resize_square(&w->c->color_tables, px, COVER_ART_SIZE, COVER_ART_SIZE, 4, w->thumb, COVER_THUMB_SIZE, w->image_scratch, COVER_ART_SIZE);
                     cov_write_jpg(c, thumb_path, w->thumb, COVER_THUMB_SIZE);
                 }
             } else if (r == COV_NO_ART && platform_file_info(job->path).exists) {
@@ -829,12 +679,12 @@ static s32 cov_slot_new(Covers *c) {
 /* ---- public API ---- */
 
 Covers *covers_create(Core_Renderer *r, const char *cache_dir, u32 worker_count) {
-    cov_init_tables();
     if (worker_count == 0) worker_count = 2;
     worker_count = CORE_MIN(worker_count, (u32)COV_MAX_WORKERS);
 
     Covers *c = core_heap_calloc(sizeof(Covers));
     if (!c) return 0;
+    core_image_color_tables_init(&c->color_tables);
     c->r = r;
     snprintf(c->thumbs_dir, sizeof(c->thumbs_dir), "%s/thumbs", cache_dir);
     platform_make_dirs(c->thumbs_dir);

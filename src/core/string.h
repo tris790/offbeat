@@ -3,6 +3,7 @@
 
 #include "types.h"
 #include "memory.h"
+#include <stdarg.h>
 
 /*
  * UTF-8 strings. `Core_String` is a length-prefixed view (not necessarily
@@ -27,12 +28,31 @@ typedef struct {
 
 Core_String core_str(const char *cstr);                          /* from null-terminated */
 Core_String core_str_n(const u8 *bytes, u64 len);
-Core_String core_str_copy(Core_Arena *arena, Core_String s);     /* owned copy in arena   */
+Core_String core_str_copy(Core_Arena *arena, Core_String s);     /* NUL-terminated owned copy; {0} on OOM */
 char       *core_str_to_cstr(Core_Arena *arena, Core_String s);  /* null-terminated copy  */
+
+/* Heap copy; release with core_heap_free. Returns 0 on OOM. */
+char *core_str_heap_cstr(Core_String s);
+/* Bounded, overlapping-safe copies; return bytes written excluding NUL.
+   cap=0 writes nothing. Truncation preserves complete UTF-8 sequences.
+   The cstr variant scans at most cap bytes rather than strlen(src). */
+u64 core_str_write_cstr(char *dst, u64 cap, Core_String s);
+u64 core_cstr_copy(char *dst, u64 cap, const char *src);
+/* One formatting pass for small strings; exact-sized fallback for long ones. */
+Core_String core_str_vfmt(Core_Arena *arena, const char *fmt, va_list args);
+Core_String core_str_fmt(Core_Arena *arena, const char *fmt, ...);
 
 /* ---- inspection ---- */
 
 b32 core_str_eq(Core_String a, Core_String b);
+s32 core_str_cmp(Core_String a, Core_String b);
+u8 core_ascii_lower(u8 c);
+b32 core_ascii_space(u8 c);
+s32 core_str_cmp_ascii_ci(Core_String a, Core_String b);
+b32 core_str_eq_ascii_ci(Core_String a, Core_String b);
+b32 core_cstr_starts_ascii_ci(const char *s, const char *prefix);
+b32 core_cstr_ends_ascii_ci(const char *s, const char *suffix);
+Core_String core_str_trim_ascii(Core_String s);
 u64 core_str_count_codepoints(Core_String s); /* number of UTF-8 codepoints */
 
 /* ---- slicing (returns views into the same backing memory) ---- */
@@ -42,6 +62,15 @@ Core_String core_str_prefix(Core_String s, u64 byte_len);
 Core_String core_str_suffix(Core_String s, u64 byte_off);
 
 /* ---- UTF-8 codec ---- */
+
+b32 core_utf8_valid(Core_String s);
+/* Clamp a byte limit to a complete sequence; valid UTF-8 input expected. */
+Core_String core_str_prefix_utf8(Core_String s, u64 byte_len);
+/* Previous codepoint boundary (clamps at to s.len). */
+u64 core_utf8_prev(Core_String s, u64 at);
+/* Latin-1/Extended-A accent and ASCII case folding; other scripts unchanged.
+   Search normalization, not general Unicode casefolding or collation. */
+u32 core_unicode_fold_latin(u32 codepoint);
 
 /* Decode the codepoint at byte offset `at` (must be < s.len). */
 Core_Utf8Decode core_utf8_decode(Core_String s, u64 at);
@@ -55,6 +84,7 @@ typedef struct {
     u8 *str;
     u64 len;
     u64 cap;
+    b32 failed; /* sticky OOM/size overflow; finish returns {0} */
 } Core_StringBuilder;
 
 Core_StringBuilder core_sb_begin(Core_Arena *arena, u64 initial_cap);

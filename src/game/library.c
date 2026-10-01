@@ -22,6 +22,7 @@
  */
 
 #include "library.h"
+#include "../core/hash.h"
 #include "../platform/platform.h"
 
 #include <stdatomic.h>
@@ -39,60 +40,20 @@ static u32 lib_syncsafe(const u8 *p) {
            ((u32)(p[2] & 0x7F) << 7)  |  (u32)(p[3] & 0x7F);
 }
 
-static u8 lib_lower(u8 c) { return (c >= 'A' && c <= 'Z') ? (u8)(c + 32) : c; }
-static b32 lib_is_space(u8 c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; }
-
-static Core_String lib_trim(Core_String s) {
-    while (s.len && lib_is_space(s.str[0])) { s.str++; s.len--; }
-    while (s.len && lib_is_space(s.str[s.len - 1])) s.len--;
-    return s;
-}
-
-/* ASCII case-insensitive compare of UTF-8 bytes (enough for Latin sorting). */
-static s32 lib_cmp_ci(Core_String a, Core_String b) {
-    u64 n = CORE_MIN(a.len, b.len);
-    for (u64 i = 0; i < n; i++) {
-        u8 x = lib_lower(a.str[i]), y = lib_lower(b.str[i]);
-        if (x != y) return x < y ? -1 : 1;
-    }
-    return a.len == b.len ? 0 : (a.len < b.len ? -1 : 1);
-}
-
-static s32 lib_cmp_bytes(Core_String a, Core_String b) {
-    u64 n = CORE_MIN(a.len, b.len);
-    int r = n ? memcmp(a.str, b.str, n) : 0;
-    if (r) return r < 0 ? -1 : 1;
-    return a.len == b.len ? 0 : (a.len < b.len ? -1 : 1);
-}
-
-/* Case-insensitive equality against an ASCII literal. */
+/* Tag keys are ASCII; values retain their original UTF-8 bytes. */
 static b32 lib_ieq(const u8 *s, u64 len, const char *lit) {
-    u64 n = strlen(lit);
-    if (len != n) return false;
-    for (u64 i = 0; i < n; i++) if (lib_lower(s[i]) != (u8)lit[i]) return false;
-    return true;
+    return core_str_eq_ascii_ci(core_str_n(s, len), core_str(lit));
 }
 
 /* First 8 lowercased bytes packed big-endian: most sort comparisons end here. */
 static u64 lib_sort_key(Core_String s) {
     u64 k = 0;
-    for (u32 i = 0; i < 8; i++) k = (k << 8) | (i < s.len ? lib_lower(s.str[i]) : 0);
+    for (u32 i = 0; i < 8; i++) k = (k << 8) | (i < s.len ? core_ascii_lower(s.str[i]) : 0);
     return k;
 }
 
 u64 library_hash_path(Core_String path) {
-    u64 h = 0xcbf29ce484222325ull;
-    for (u64 i = 0; i < path.len; i++) { h ^= path.str[i]; h *= 0x100000001b3ull; }
-    return h;
-}
-
-/* Copy into the arena with a trailing NUL (not counted in len). */
-static Core_String lib_str_copy(Core_Arena *a, Core_String s) {
-    u8 *dst = core_arena_push(a, s.len + 1, 1);
-    if (!dst) return (Core_String){0};
-    if (s.len) memcpy(dst, s.str, s.len);
-    dst[s.len] = 0;
-    return (Core_String){ .str = dst, .len = s.len };
+    return core_hash_bytes(path.str, path.len);
 }
 
 /* ---- buffered positional reader ----
@@ -152,16 +113,6 @@ static void lib_emit(Lib_TextOut *t, u32 cp) {
     t->len += core_utf8_encode(t->out + t->len, cp);
 }
 
-static b32 lib_utf8_valid(const u8 *p, u64 n) {
-    Core_String s = core_str_n(p, n);
-    for (u64 i = 0; i < n;) {
-        Core_Utf8Decode d = core_utf8_decode(s, i);
-        if (d.size == 1 && p[i] >= 0x80) return false;
-        i += d.size;
-    }
-    return true;
-}
-
 /* Decode tag text to UTF-8 into the arena. enc: 0 = ISO-8859-1, 1 = UTF-16
    with BOM, 2 = UTF-16BE, 3 = UTF-8. NUL-separated values are joined with
    ", ", control characters become spaces and both ends are trimmed. The
@@ -173,7 +124,7 @@ static Core_String lib_decode_text(Core_Arena *a, u32 enc, const u8 *p, u64 n) {
     u64 mark = a->used;
     Lib_TextOut t = { .out = out };
 
-    if (enc == 3 && !lib_utf8_valid(p, n)) enc = 0; /* mislabeled Latin-1 */
+    if (enc == 3 && !core_utf8_valid(core_str_n(p, n))) enc = 0; /* mislabeled Latin-1 */
     if (enc == 0) {
         for (u64 i = 0; i < n; i++) lib_emit(&t, p[i]);
     } else if (enc == 3) {
@@ -214,7 +165,7 @@ static Core_String lib_decode_text(Core_Arena *a, u32 enc, const u8 *p, u64 n) {
 
     /* Give back the unused tail when we are still the last allocation. */
     if (a->used == mark) a->used = mark - cap + t.len + 1;
-    Core_String s = lib_trim((Core_String){ .str = out, .len = t.len });
+    Core_String s = core_str_trim_ascii((Core_String){ .str = out, .len = t.len });
     s.str[s.len] = 0;
     return s;
 }
@@ -292,7 +243,7 @@ static Core_String lib_genre_clean(Core_String g) {
         Core_String inner = core_str_substr(g, 1, close - 1);
         if (lib_parse_uint(inner, &n)) { if (ref == 0xFFFFFFFF) ref = n; }
         else if (!lib_ieq(inner.str, inner.len, "rx") && !lib_ieq(inner.str, inner.len, "cr")) break;
-        g = lib_trim(core_str_suffix(g, close + 1));
+        g = core_str_trim_ascii(core_str_suffix(g, close + 1));
     }
     if (lib_parse_uint(g, &n)) { ref = n; g.len = 0; }
     if (g.len == 0 && ref < CORE_ARRAY_COUNT(lib_genres)) g = core_str(lib_genres[ref]);
@@ -800,10 +751,10 @@ b32 library_read_tags(Core_Arena *arena, const char *path, Lib_TagInfo *out) {
     if (format == LIB_FORMAT_UNKNOWN) return false;
 
     out->format       = format;
-    out->title        = f.title.len  ? f.title  : lib_str_copy(arena, lib_file_stem(spath));
+    out->title        = f.title.len  ? f.title  : core_str_copy(arena, lib_file_stem(spath));
     out->artist       = f.artist.len ? f.artist : f.band.len ? f.band : core_str_lit("Unknown Artist");
     out->album        = f.album;
-    out->genre        = f.genre.len  ? f.genre  : lib_str_copy(arena, lib_parent_name(spath));
+    out->genre        = f.genre.len  ? f.genre  : core_str_copy(arena, lib_parent_name(spath));
     out->duration_ms  = f.duration_ms;
     out->cover_offset = f.cover_offset;
     out->cover_size   = f.cover_size;
@@ -849,9 +800,9 @@ static s32 lib_cmp_by_title(const void *ctx, u32 a, u32 b) {
     const Lib_SortCtx *c = ctx;
     if (c->key[a] != c->key[b]) return c->key[a] < c->key[b] ? -1 : 1;
     const Lib_Track *x = &c->tracks[a], *y = &c->tracks[b];
-    s32 r = lib_cmp_ci(x->title, y->title);
-    if (!r) r = lib_cmp_ci(x->artist, y->artist);
-    if (!r) r = lib_cmp_bytes(x->path, y->path);
+    s32 r = core_str_cmp_ascii_ci(x->title, y->title);
+    if (!r) r = core_str_cmp_ascii_ci(x->artist, y->artist);
+    if (!r) r = core_str_cmp(x->path, y->path);
     return r;
 }
 
@@ -859,9 +810,9 @@ static s32 lib_cmp_by_artist(const void *ctx, u32 a, u32 b) {
     const Lib_SortCtx *c = ctx;
     if (c->key[a] != c->key[b]) return c->key[a] < c->key[b] ? -1 : 1;
     const Lib_Track *x = &c->tracks[a], *y = &c->tracks[b];
-    s32 r = lib_cmp_ci(x->artist, y->artist);
-    if (!r) r = lib_cmp_ci(x->title, y->title);
-    if (!r) r = lib_cmp_bytes(x->path, y->path);
+    s32 r = core_str_cmp_ascii_ci(x->artist, y->artist);
+    if (!r) r = core_str_cmp_ascii_ci(x->title, y->title);
+    if (!r) r = core_str_cmp(x->path, y->path);
     return r;
 }
 
@@ -869,10 +820,10 @@ static s32 lib_cmp_by_genre(const void *ctx, u32 a, u32 b) {
     const Lib_SortCtx *c = ctx;
     if (c->key[a] != c->key[b]) return c->key[a] < c->key[b] ? -1 : 1;
     const Lib_Track *x = &c->tracks[a], *y = &c->tracks[b];
-    s32 r = lib_cmp_ci(x->genre, y->genre);
-    if (!r) r = lib_cmp_ci(x->artist, y->artist);
-    if (!r) r = lib_cmp_ci(x->title, y->title);
-    if (!r) r = lib_cmp_bytes(x->path, y->path);
+    s32 r = core_str_cmp_ascii_ci(x->genre, y->genre);
+    if (!r) r = core_str_cmp_ascii_ci(x->artist, y->artist);
+    if (!r) r = core_str_cmp_ascii_ci(x->title, y->title);
+    if (!r) r = core_str_cmp(x->path, y->path);
     return r;
 }
 
@@ -926,13 +877,13 @@ static b32 lib_build_indices(Library *lib, Core_Arena *scratch) {
        run the tracks are already sorted by title. */
     u32 count = 0;
     for (u32 i = 0; i < n; i++)
-        if (i == 0 || lib_cmp_ci(lib->tracks[by_artist[i]].artist, lib->tracks[by_artist[i - 1]].artist)) count++;
+        if (i == 0 || core_str_cmp_ascii_ci(lib->tracks[by_artist[i]].artist, lib->tracks[by_artist[i - 1]].artist)) count++;
     lib->artists = core_push_array(&lib->arena, Lib_Artist, count + 1);
     if (!lib->artists) { core_temp_end(temp); return false; }
     lib->artist_count = 0;
     for (u32 i = 0; i < n; i++) {
         Lib_Track *t = &lib->tracks[by_artist[i]];
-        if (i == 0 || lib_cmp_ci(t->artist, lib->tracks[by_artist[i - 1]].artist)) {
+        if (i == 0 || core_str_cmp_ascii_ci(t->artist, lib->tracks[by_artist[i - 1]].artist)) {
             Lib_Artist *a = &lib->artists[lib->artist_count++];
             a->name   = t->artist;
             a->tracks = by_artist + i;
@@ -946,13 +897,13 @@ static b32 lib_build_indices(Library *lib, Core_Arena *scratch) {
     lib_sort(by_genre, tmp, n, lib_cmp_by_genre, &ctx);
     count = 0;
     for (u32 i = 0; i < n; i++)
-        if (i == 0 || lib_cmp_ci(lib->tracks[by_genre[i]].genre, lib->tracks[by_genre[i - 1]].genre)) count++;
+        if (i == 0 || core_str_cmp_ascii_ci(lib->tracks[by_genre[i]].genre, lib->tracks[by_genre[i - 1]].genre)) count++;
     lib->genres = core_push_array(&lib->arena, Lib_Genre, count + 1);
     if (!lib->genres) { core_temp_end(temp); return false; }
     lib->genre_count = 0;
     for (u32 i = 0; i < n; i++) {
         Lib_Track *t = &lib->tracks[by_genre[i]];
-        if (i == 0 || lib_cmp_ci(t->genre, lib->tracks[by_genre[i - 1]].genre)) {
+        if (i == 0 || core_str_cmp_ascii_ci(t->genre, lib->tracks[by_genre[i - 1]].genre)) {
             Lib_Genre *g = &lib->genres[lib->genre_count++];
             g->name   = t->genre;
             g->tracks = by_genre + i;
@@ -1258,7 +1209,7 @@ static b32 lib_walk_visit(void *user, const char *path, u64 size, s64 mtime_ns) 
     Lib_ScanFile *f = core_push_struct(w->files, Lib_ScanFile);
     if (!f) return false;
     if (!w->first) w->first = f;
-    f->path     = lib_str_copy(w->paths, p);
+    f->path     = core_str_copy(w->paths, p);
     f->size     = size;
     f->mtime_ns = mtime_ns;
     f->hash     = library_hash_path(p);
@@ -1269,7 +1220,7 @@ static b32 lib_walk_visit(void *user, const char *path, u64 size, s64 mtime_ns) 
 
 static s32 lib_cmp_scan_path(const void *ctx, u32 a, u32 b) {
     const Lib_ScanFile *f = ctx;
-    return lib_cmp_bytes(f[a].path, f[b].path);
+    return core_str_cmp(f[a].path, f[b].path);
 }
 
 /* Interns repeated strings (artist/album/genre) into the snapshot arena. */
@@ -1282,12 +1233,12 @@ typedef struct {
 } Lib_Intern;
 
 static Core_String lib_intern(Lib_Intern *in, Core_String s) {
-    if (in->count * 2 >= in->cap) return lib_str_copy(in->dst, s); /* table full: just copy */
+    if (in->count * 2 >= in->cap) return core_str_copy(in->dst, s); /* table full: just copy */
     u64 h = library_hash_path(s) | 1;
     for (u64 i = h & (in->cap - 1);; i = (i + 1) & (in->cap - 1)) {
         if (!in->hashes[i]) {
             in->hashes[i] = h;
-            in->slots[i] = lib_str_copy(in->dst, s);
+            in->slots[i] = core_str_copy(in->dst, s);
             in->count++;
             return in->slots[i];
         }
@@ -1318,7 +1269,7 @@ static Library *lib_scan_build(Lib_Scanner *s, b32 *out_changed) {
     lib = lib_create();
     if (!lib) goto done;
     lib->tracks = core_push_array(&lib->arena, Lib_Track, n + 1);
-    lib->music_dir = lib_str_copy(&lib->arena, core_str(s->music_dir));
+    lib->music_dir = core_str_copy(&lib->arena, core_str(s->music_dir));
     Lib_Intern in = { .dst = &lib->arena, .cap = 64 };
     while (in.cap < (u64)n * 4 + 16) in.cap *= 2;
     in.slots  = core_push_array(&scratch, Core_String, in.cap);
@@ -1335,7 +1286,7 @@ static Library *lib_scan_build(Lib_Scanner *s, b32 *out_changed) {
         const Lib_Track *pt = pi >= 0 ? &prev->tracks[pi] : 0;
         if (pt && pt->file_size == f->size && pt->mtime_ns == f->mtime_ns && core_str_eq(pt->path, f->path)) {
             *t = *pt; /* unchanged: no file access at all */
-            t->title  = lib_str_copy(&lib->arena, pt->title);
+            t->title  = core_str_copy(&lib->arena, pt->title);
             t->artist = lib_intern(&in, pt->artist);
             t->album  = lib_intern(&in, pt->album);
             reused++;
@@ -1343,7 +1294,7 @@ static Library *lib_scan_build(Lib_Scanner *s, b32 *out_changed) {
             core_arena_reset(&tags);
             Lib_TagInfo info;
             if (!library_read_tags(&tags, (const char *)f->path.str, &info)) continue;
-            t->title        = lib_str_copy(&lib->arena, info.title);
+            t->title        = core_str_copy(&lib->arena, info.title);
             t->artist       = lib_intern(&in, info.artist);
             t->album        = lib_intern(&in, info.album);
             t->cover_offset = info.cover_offset;
@@ -1353,7 +1304,7 @@ static Library *lib_scan_build(Lib_Scanner *s, b32 *out_changed) {
             t->format       = info.format;
             parsed++;
         }
-        t->path      = lib_str_copy(&lib->arena, f->path);
+        t->path      = core_str_copy(&lib->arena, f->path);
         t->genre     = lib_intern(&in, lib_genre_from_path(f->path, lib->music_dir));
         t->path_hash = f->hash;
         t->file_size = f->size;
@@ -1385,18 +1336,11 @@ static void lib_scan_thread(void *user) {
     atomic_store_explicit(&s->done, 1, memory_order_release);
 }
 
-static char *lib_heap_cstr(const char *s) {
-    u64 n = strlen(s);
-    char *d = core_heap_alloc(n + 1);
-    if (d) memcpy(d, s, n + 1);
-    return d;
-}
-
 Lib_Scanner *library_scan_start(const char *music_dir, const char *cache_path, const Library *previous) {
     Lib_Scanner *s = core_heap_calloc(sizeof(Lib_Scanner));
     if (!s) return 0;
-    s->music_dir  = lib_heap_cstr(music_dir);
-    s->cache_path = lib_heap_cstr(cache_path);
+    s->music_dir  = core_str_heap_cstr(core_str(music_dir));
+    s->cache_path = core_str_heap_cstr(core_str(cache_path));
     s->previous   = previous;
     if (s->music_dir && s->cache_path) s->thread = platform_thread_start(lib_scan_thread, s, "lib-scan");
     if (!s->thread) atomic_store(&s->done, 1); /* nothing to wait for */

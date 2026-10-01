@@ -14,6 +14,7 @@
  */
 
 #include "app.h"
+#include "../core/random.h"
 
 #include "covers.h"
 #include "download.h"
@@ -211,23 +212,15 @@ struct App {
 /* ------------------------------------------------------------------------- */
 
 static const char *str_c(App *app, Core_String s) {
-    char *out = core_arena_push(&app->frame, s.len + 1, 1);
-    memcpy(out, s.str, s.len);
-    out[s.len] = 0;
-    return out;
+    return core_str_to_cstr(&app->frame, s);
 }
 
 static Core_String str_fmt(App *app, const char *fmt, ...) {
-    char buf[512];
-    va_list ap;
-    va_start(ap, fmt);
-    int n = vsnprintf(buf, sizeof(buf), fmt, ap);
-    va_end(ap);
-    if (n < 0) n = 0;
-    if (n > (int)sizeof(buf) - 1) n = sizeof(buf) - 1;
-    u8 *p = core_arena_push(&app->frame, (u64)n + 1, 1);
-    memcpy(p, buf, (size_t)n + 1);
-    return (Core_String){ .str = p, .len = (u64)n };
+    va_list args;
+    va_start(args, fmt);
+    Core_String result = core_str_vfmt(&app->frame, fmt, args);
+    va_end(args);
+    return result;
 }
 
 static Core_String fmt_time(App *app, f64 s) {
@@ -237,15 +230,6 @@ static Core_String fmt_time(App *app, f64 s) {
     return str_fmt(app, "%u:%02u", t / 60, t % 60);
 }
 
-static void copy_str(char *dst, u32 cap, Core_String s) {
-    u32 n = (u32)CORE_MIN(s.len, (u64)cap - 1);
-    memcpy(dst, s.str, n);
-    dst[n] = 0;
-}
-
-static f32 clamp01(f32 x) { return x < 0 ? 0 : (x > 1 ? 1 : x); }
-static f32 ease_out_cubic(f32 t) { t = clamp01(t); f32 u = 1 - t; return 1 - u * u * u; }
-
 static const Lib_Track *track_at(App *app, u32 index) {
     if (!app->lib || index >= app->lib->track_count) return 0;
     return &app->lib->tracks[index];
@@ -254,16 +238,6 @@ static const Lib_Track *track_at(App *app, u32 index) {
 static const Lib_Track *current_track(App *app) {
     if (app->cur < 0 || (u32)app->cur >= app->queue_len) return 0;
     return track_at(app, app->queue[app->cur]);
-}
-
-/* Deterministic pleasant color per hash (placeholders). */
-static vec4 hash_color(u64 h, f32 a) {
-    f32 hue = (f32)(h % 360) / 360.0f;
-    f32 r = 0.5f + 0.5f * cosf(CORE_TAU * (hue + 0.0f));
-    f32 g = 0.5f + 0.5f * cosf(CORE_TAU * (hue + 0.33f));
-    f32 b = 0.5f + 0.5f * cosf(CORE_TAU * (hue + 0.67f));
-    /* pull toward the violet theme and darken */
-    return (vec4){ .x = 0.18f + r * 0.28f, .y = 0.12f + g * 0.2f, .z = 0.3f + b * 0.3f, .w = a };
 }
 
 /* ------------------------------------------------------------------------- */
@@ -337,17 +311,14 @@ static void queue_reserve(App *app, u32 n) {
 }
 
 static u32 rng_state = 0x9E3779B9u;
-static u32 rng_next(void) {
-    rng_state ^= rng_state << 13; rng_state ^= rng_state >> 17; rng_state ^= rng_state << 5;
-    return rng_state;
-}
+
 
 /* Shuffle everything after the current item. */
 static void queue_shuffle_upcoming(App *app) {
     if (app->queue_len < 3) return;
     u32 start = (u32)(app->cur + 1);
     for (u32 i = app->queue_len - 1; i > start; i--) {
-        u32 j = start + rng_next() % (i - start + 1);
+        u32 j = start + core_rng_next(&rng_state) % (i - start + 1);
         u32 t = app->queue[i]; app->queue[i] = app->queue[j]; app->queue[j] = t;
     }
 }
@@ -706,7 +677,7 @@ static b32 game_delete_song(App *app, u32 track) {
    download.h). Artists the library doesn't have yet go to the chosen folder,
    by default "Downloads" inside the music folder (their own group). */
 static void apply_download_settings(App *app) {
-    if (app->settings.download_dir[0]) snprintf(app->download_dest, sizeof(app->download_dest), "%s", app->settings.download_dir);
+    if (app->settings.download_dir[0]) core_cstr_copy(app->download_dest, sizeof(app->download_dest), app->settings.download_dir);
     else snprintf(app->download_dest, sizeof(app->download_dest), "%s/Downloads", app->music_dir);
     downloads_configure(app->downloads, app->download_dest, app->settings.download_parallel);
     downloads_set_library(app->downloads, app->music_dir);
@@ -714,7 +685,7 @@ static void apply_download_settings(App *app) {
 
 static void set_music_dir(App *app, const char *dir) {
     if (strcmp(dir, app->music_dir) == 0) return;
-    snprintf(app->settings.music_dir, sizeof(app->settings.music_dir), "%s", dir);
+    core_cstr_copy(app->settings.music_dir, sizeof(app->settings.music_dir), dir);
     app->music_dir = app->settings.music_dir;
     save_settings(app);
     apply_download_settings(app);
@@ -1020,7 +991,7 @@ static vec3 ribbon_color(f32 s, Scene_Colors sc) {
     vec3 blue = v3(0.34f, 0.52f, 1.0f);
     if (s < 0.30f) return vec3_lerp(pink, mag, s / 0.30f);
     if (s < 0.55f) return vec3_lerp(mag, vio, (s - 0.30f) / 0.25f);
-    return vec3_lerp(vio, blue, clamp01((s - 0.55f) / 0.3f));
+    return vec3_lerp(vio, blue, core_saturate((s - 0.55f) / 0.3f));
 }
 
 static f32 hash01(u32 x) {
@@ -1082,7 +1053,7 @@ static void draw_ribbon(App *app, vec2 C, f32 R, Scene_Colors sc, f32 alpha) {
             f32 off = u * width * twist + wob * e;
             vec2 pt = vec2_add(C, vec2_mul(vec2_add(base[j], vec2_mul(nrm[j], off)), R));
             if (j > 0) {
-                f32 fade = clamp01(s * 7.0f) * clamp01((1.0f - s) * 4.0f);
+                f32 fade = core_saturate(s * 7.0f) * core_saturate((1.0f - s) * 4.0f);
                 f32 a = base_a * fade * (0.8f + 0.7f * band + 0.4f * sp->beat);
                 vec3 c = vec3_lerp(ribbon_color(s, sc), v3(1, 0.92f, 1), whiten);
                 core_draw_line(r, prev, pt, th, ui_rgb(c, a));
@@ -1190,7 +1161,7 @@ static void draw_ring(App *app, vec2 C, f32 R, f32 progress, f64 duration) {
     f32 hover = ui_ease(ui, ui_idx(id, 1), (near || dragging) ? 1.0f : 0.0f, 14.0f);
     core_draw_circle_ex(r, C, R, S(1.2f), 0, UI_RGBA(255, 255, 255, 0.07f + 0.05f * hover));
     f32 a0 = -CORE_PI * 0.5f;
-    f32 sweep = CORE_TAU * clamp01(progress);
+    f32 sweep = CORE_TAU * core_saturate(progress);
     core_set_blend(r, CORE_BLEND_ADD);
     core_draw_arc(r, C, R, S(6), a0, sweep, UI_RGBA(168, 85, 247, 0.10f));
     core_set_blend(r, CORE_BLEND_NORMAL);
@@ -1219,11 +1190,11 @@ static void draw_cover_card(App *app, vec2 center, f32 size) {
 
     /* placeholder base */
     const Lib_Track *t = current_track(app);
-    Core_BoxStyle ph = { .radius = rad, .fill = hash_color(t ? t->path_hash : 7, 1),
+    Core_BoxStyle ph = { .radius = rad, .fill = game_ui_hash_color(t ? t->path_hash : 7, 1),
                          .fill2 = UI_RGBA(20, 16, 36, 1), .gradient = 1 };
     core_draw_box(r, pos, dim, &ph);
 
-    f32 fade = art.ready && !art.missing ? ease_out_cubic(art.age / 0.35f) : 0;
+    f32 fade = art.ready && !art.missing ? core_ease_out_cubic(art.age / 0.35f) : 0;
     if (prev.ready && !prev.missing && fade < 1)
         core_draw_image_rounded(r, prev.tex, pos, dim, vec2_zero(), vec2_make(1, 1), rad, -1,
                                 (vec4){ .x = 1, .y = 1, .z = 1, .w = 1 - fade });
@@ -1256,18 +1227,18 @@ static void draw_titles(App *app, f32 cx, f32 ty, f32 ay) {
         memcpy(app->prev_title, app->shown_title, sizeof(app->prev_title));
         memcpy(app->prev_artist, app->shown_artist, sizeof(app->prev_artist));
         if (t) {
-            copy_str(app->shown_title, sizeof(app->shown_title), t->title);
-            copy_str(app->shown_artist, sizeof(app->shown_artist), t->artist);
+            core_str_write_cstr(app->shown_title, sizeof(app->shown_title), t->title);
+            core_str_write_cstr(app->shown_artist, sizeof(app->shown_artist), t->artist);
         } else {
-            snprintf(app->shown_title, sizeof(app->shown_title), "%s", app->lib ? "Nothing playing" : "Scanning library");
-            snprintf(app->shown_artist, sizeof(app->shown_artist), "%s", app->lib ? "Pick a song or press Ctrl K" : "One moment");
+            core_cstr_copy(app->shown_title, sizeof(app->shown_title), app->lib ? "Nothing playing" : "Scanning library");
+            core_cstr_copy(app->shown_artist, sizeof(app->shown_artist), app->lib ? "Pick a song or press Ctrl K" : "One moment");
         }
         b32 first = app->shown_hash == 0 && app->prev_title[0] == 0;
         app->shown_hash = h;
         ui_anim_set(ui, ui_id("title.swap"), first ? 1.0f : 0.0f);
     }
     f32 k = ui_ease(ui, ui_id("title.swap"), 1.0f, 5.5f);
-    f32 e = ease_out_cubic(k);
+    f32 e = core_ease_out_cubic(k);
     f32 max_w = S(560);
     f32 tp = S(26), ap = S(17);
     if (k < 1) {
@@ -1279,7 +1250,7 @@ static void draw_titles(App *app, f32 cx, f32 ty, f32 ay) {
     }
     ui_text(ui, ui->font_med, core_str(app->shown_title), cx, ty + S(18) * (1 - e), tp,
             ui_alpha(UI_TEXT, e), UI_ALIGN_CENTER, max_w);
-    f32 e2 = ease_out_cubic(clamp01(k * 1.25f - 0.25f));
+    f32 e2 = core_ease_out_cubic(core_saturate(k * 1.25f - 0.25f));
     ui_text(ui, ui->font, core_str(app->shown_artist), cx, ay + S(18) * (1 - e2), ap,
             ui_alpha(UI_LAVENDER, e2), UI_ALIGN_CENTER, max_w);
 }
@@ -1320,7 +1291,7 @@ static void draw_seek_bar(App *app, f32 x0, f32 x1, f32 y, Player_Status *st) {
     Ui_Interact it = ui_interact(ui, id, vec2_make(x0 - S(6), y - S(12)), vec2_make(x1 - x0 + S(12), S(24)),
                                  PLATFORM_CURSOR_HAND);
     f32 progress = dur > 0 ? (f32)(st->position_s / dur) : 0;
-    f32 mx = clamp01((ui->in->mouse_pos.x - x0) / (x1 - x0));
+    f32 mx = core_saturate((ui->in->mouse_pos.x - x0) / (x1 - x0));
     if (it.held && dur > 0) {
         app->seeking = true;
         app->seek_preview = mx;
@@ -1336,7 +1307,7 @@ static void draw_seek_bar(App *app, f32 x0, f32 x1, f32 y, Player_Status *st) {
 
     f32 grow = ui_ease(ui, ui_idx(id, 3), (it.hovered || it.held) ? 1.0f : 0.0f, 16.0f);
     f32 th = S(3.0f + 2.0f * grow);
-    f32 px = x0 + (x1 - x0) * clamp01(progress);
+    f32 px = x0 + (x1 - x0) * core_saturate(progress);
     core_draw_rect_rounded(r, vec2_make(x0, y - th * 0.5f), vec2_make(x1 - x0, th), th * 0.5f,
                            UI_RGBA(255, 255, 255, 0.16f));
     Core_BoxStyle fill = { .radius = th * 0.5f, .fill = UI_RGBA(236, 232, 255, 1),
@@ -1503,7 +1474,7 @@ static List_View list_begin(App *app, Scroll *sc, u64 id, vec2 pos, vec2 size, u
                                   vec2_make(bar_w + S(10), track_h), PLATFORM_CURSOR_DEFAULT);
     if (max_scroll > 0 && bar.held) {
         f32 rel = (in->mouse_pos.y - track_pos.y - thumb_h * 0.5f) / CORE_MAX(1.0f, track_h - thumb_h);
-        sc->target = clamp01(rel) * max_scroll;
+        sc->target = core_saturate(rel) * max_scroll;
         sc->pos = sc->target;
         sc->idle = 0;
         app->queue_follow = false;
@@ -1551,10 +1522,10 @@ static void list_end(App *app, List_View *lv) {
 static void draw_thumb(App *app, const Lib_Track *t, vec2 pos, f32 size, f32 radius, f32 alpha) {
     Ui *ui = &app->ui;
     Cover_Thumb th = covers_thumb(app->covers, t);
-    f32 fade = th.ready ? ease_out_cubic(th.age / 0.25f) : 0;
+    f32 fade = th.ready ? core_ease_out_cubic(th.age / 0.25f) : 0;
     if (th.ready && th.age < 0.3f) ui->animating = true;
     if (fade < 1) {
-        Core_BoxStyle ph = { .radius = radius, .fill = hash_color(t->path_hash, alpha),
+        Core_BoxStyle ph = { .radius = radius, .fill = game_ui_hash_color(t->path_hash, alpha),
                              .fill2 = UI_RGBA(24, 20, 40, alpha), .gradient = 1 };
         core_draw_box(app->r, pos, vec2_make(size, size), &ph);
         if (th.missing || !th.ready)
@@ -1843,10 +1814,7 @@ static void game_panel_filter_open(App *app, s32 scope) {
 }
 
 static u32 game_filter_prev(const Panel_Filter *f, u32 at) {
-    if (!at) return 0;
-    at--;
-    while (at && (f->query[at] & 0xC0) == 0x80) at--;
-    return at;
+    return (u32)core_utf8_prev(core_str_n((u8 *)f->query, f->len), at);
 }
 
 static u32 game_filter_next(const Panel_Filter *f, u32 at) {
@@ -1905,12 +1873,8 @@ static b32 game_panel_filter_input(App *app, const Platform_Input *in) {
         game_panel_filter_changed(app, scope);
     }
     if (typing) {
-        u32 n = 0;
-        while (n < in->text_len) {
-            Core_Utf8Decode d = core_utf8_decode((Core_String){(u8 *)in->text, in->text_len}, n);
-            if (n + d.size > in->text_len || f->len + n + d.size > sizeof(f->query) - 1) break;
-            n += d.size;
-        }
+        u32 n = (u32)core_str_prefix_utf8(core_str_n((u8 *)in->text, in->text_len),
+                                        sizeof(f->query) - 1 - f->len).len;
         if (n) {
             memmove(f->query + f->caret + n, f->query + f->caret, f->len - f->caret);
             memcpy(f->query + f->caret, in->text, n);
@@ -1965,7 +1929,7 @@ static const u32 *game_draw_filter_header(App *app, vec2 *pos, vec2 *size, s32 s
     f32 hh = S(34), bh = S(28), cy = pos->y + hh * 0.5f;
     f32 label_w = ui_text_width(ui, ui->font, label, S(13));
     f32 max_w = CORE_MIN(S(236), CORE_MAX(S(100), size->x - label_w - S(42)));
-    f32 reveal = clamp01(ui_spring(ui, ui_idx(id, 1), f->open ? 1 : 0, 480, 40));
+    f32 reveal = core_saturate(ui_spring(ui, ui_idx(id, 1), f->open ? 1 : 0, 480, 40));
     f32 bw = S(28) + (max_w - S(28)) * reveal;
     vec2 bp = vec2_make(pos->x + size->x - S(8) - bw, cy - bh * 0.5f);
     vec2 bs = vec2_make(bw, bh);
@@ -2368,7 +2332,7 @@ static void draw_palette(App *app, vec2 win) {
     const Platform_Input *in = ui->in;
     f32 open = ui_spring(ui, ui_id("pal.open"), app->search_open ? 1.0f : 0.0f, 420, 34);
     if (open < 0.004f && !app->search_open) return;
-    f32 vis = clamp01(open);
+    f32 vis = core_saturate(open);
 
     /* backdrop */
     core_draw_rect(r, vec2_zero(), win, UI_RGBA(6, 5, 12, 0.42f * vis));
@@ -2376,7 +2340,8 @@ static void draw_palette(App *app, vec2 win) {
     if (app->search_open && app->menu == MENU_NONE) {
         /* keyboard (idle while a context menu floats above) */
         if (in->text_len) {
-            u32 n = CORE_MIN(in->text_len, (u32)sizeof(app->query) - app->query_len);
+            u32 n = (u32)core_str_prefix_utf8(core_str_n((u8 *)in->text, in->text_len),
+                                                sizeof(app->query) - app->query_len).len;
             memcpy(app->query + app->query_len, in->text, n);
             app->query_len += n;
         }
@@ -2385,9 +2350,7 @@ static void draw_palette(App *app, vec2 win) {
                 while (app->query_len && app->query[app->query_len - 1] == ' ') app->query_len--;
                 while (app->query_len && app->query[app->query_len - 1] != ' ') app->query_len--;
             } else {
-                u32 n = app->query_len - 1;
-                while (n > 0 && (app->query[n] & 0xC0) == 0x80) n--;
-                app->query_len = n;
+                app->query_len = (u32)core_utf8_prev(core_str_n((u8 *)app->query, app->query_len), app->query_len);
             }
         }
         run_search(app);
@@ -2489,8 +2452,8 @@ static void draw_palette(App *app, vec2 win) {
     for (s32 i = first; i < (s32)total_rows && i < first + 6; i++) {
         if (i < 0) continue;
         f32 y = ry0 + ((f32)i - scroll) * row_h;
-        f32 st = clamp01(appear * 3.0f - (f32)(i - first) * 0.35f);
-        f32 e = ease_out_cubic(st);
+        f32 st = core_saturate(appear * 3.0f - (f32)(i - first) * 0.35f);
+        f32 e = core_ease_out_cubic(st);
         vec2 rp = vec2_make(PX(29), y), rs = vec2_make(S(PALETTE_IW) * s, S(63) * s);
         f32 ox = S(14) * (1 - e);
         if (i < (s32)app->hit_count) {
@@ -2599,7 +2562,7 @@ static const Lib_Artist *menu_artist_of(App *app) {
 /* Open the download page on an artist's top songs, all ticked. */
 static void download_artist(App *app, Core_String name) {
     char q[256];
-    copy_str(q, sizeof(q), name);
+    core_str_write_cstr(q, sizeof(q), name);
     open_search(app, false);
     app->menu = MENU_NONE;
     dlv_search(app->dlv, DL_QUERY_ARTIST, q, true);
@@ -2633,9 +2596,9 @@ static void draw_menu(App *app, vec2 win) {
     f32 sc = 0.9f + 0.1f * t;
     vec2 sz = vec2_make(w * sc, h * sc);
     ui->input_enabled = true;
-    core_draw_shadow(r, vec2_make(p.x, p.y + S(8)), sz, S(10), S(24), UI_RGBA(0, 0, 0, 0.5f * clamp01(t)));
-    Core_BoxStyle bg = { .radius = S(10), .fill = UI_RGBA(30, 26, 48, 0.97f * clamp01(t)),
-                         .border = S(1), .border_color = UI_RGBA(255, 255, 255, 0.1f * clamp01(t)) };
+    core_draw_shadow(r, vec2_make(p.x, p.y + S(8)), sz, S(10), S(24), UI_RGBA(0, 0, 0, 0.5f * core_saturate(t)));
+    Core_BoxStyle bg = { .radius = S(10), .fill = UI_RGBA(30, 26, 48, 0.97f * core_saturate(t)),
+                         .border = S(1), .border_color = UI_RGBA(255, 255, 255, 0.1f * core_saturate(t)) };
     core_draw_box(r, p, sz, &bg);
     core_clip_push(r, p, sz);
     for (u32 i = 0; i < n; i++) {
@@ -2645,8 +2608,8 @@ static void draw_menu(App *app, vec2 win) {
         Ui_Interact it = ui_interact(ui, ui_idx(ui_id("menu.item"), i), ip, is, PLATFORM_CURSOR_HAND);
         if (it.hover_t > 0.01f) core_draw_rect_rounded(r, ip, is, S(7), UI_RGBA(139, 102, 255, 0.22f * it.hover_t));
         vec2 ic = vec2_make(ip.x + S(18), ip.y + is.y * 0.5f);
-        vec4 col = ui_alpha(ui_mix(UI_RGBA(215, 210, 235, 1), UI_TEXT, it.hover_t), clamp01(t));
-        if (act == ACT_DELETE) col = ui_alpha(UI_RGBA(255, 135, 145, 1), clamp01(t));
+        vec4 col = ui_alpha(ui_mix(UI_RGBA(215, 210, 235, 1), UI_TEXT, it.hover_t), core_saturate(t));
+        if (act == ACT_DELETE) col = ui_alpha(UI_RGBA(255, 135, 145, 1), core_saturate(t));
         if (act == ACT_NEXT || act == ACT_ARTIST_NEXT || act == ACT_GENRE_NEXT) ui_icon_queue_next(ui, ic, S(16), col);
         else if (act == ACT_QUEUE || act == ACT_ARTIST_QUEUE || act == ACT_GENRE_QUEUE) ui_icon_plus(ui, ic, S(16), col);
         else if (act == ACT_DL_ARTIST) ui_icon_download(ui, ic, S(17), col);
@@ -2708,7 +2671,7 @@ static void draw_menu(App *app, vec2 win) {
 static void browse_to(App *app, const char *path) {
     char norm[sizeof(app->browse_path)];
     if (strlen(path) >= sizeof(norm)) return; /* absurdly deep: stay put */
-    snprintf(norm, sizeof(norm), "%s", path[0] ? path : "/");
+    core_cstr_copy(norm, sizeof(norm), path[0] ? path : "/");
     u64 n = strlen(norm);
     while (n > 1 && norm[n - 1] == '/') norm[--n] = 0;
     memcpy(app->browse_path, norm, n + 1);
@@ -2802,7 +2765,7 @@ static b32 settings_toggle(App *app, const char *name, vec2 pos, b32 on, f32 vis
                                  PLATFORM_CURSOR_HAND);
     if (it.clicked) on = !on;
     f32 t = ui_spring(ui, ui_idx(id, 1), on ? 1.0f : 0.0f, 420, 26);
-    f32 tc = clamp01(t);
+    f32 tc = core_saturate(t);
     Core_BoxStyle track = { .radius = size.y * 0.5f,
                             .fill = ui_alpha(ui_mix(UI_RGBA(255, 255, 255, 0.10f + 0.04f * it.hover_t), UI_RGBA(128, 98, 236, 1), tc), vis),
                             .border = S(1), .border_color = UI_RGBA(255, 255, 255, (0.10f + 0.1f * (1 - tc)) * vis) };
@@ -2894,8 +2857,7 @@ static void draw_path(App *app, Core_String path, f32 x, f32 y, f32 px, vec4 col
         f32 room = max_w - ui_text_width(ui, f, ell, px);
         u64 at = 0;
         while (at < path.len && ui_text_width(ui, f, core_str_substr(path, at, path.len - at), px) > room) {
-            at++;
-            while (at < path.len && (path.str[at] & 0xC0) == 0x80) at++;
+            at += core_utf8_decode(path, at).size;
         }
         x += ui_text(ui, f, ell, x, y, px, col, UI_ALIGN_LEFT, 0);
         path = core_str_substr(path, at, path.len - at);
@@ -3012,7 +2974,7 @@ static void draw_settings_browse(App *app, vec2 p, f32 w, f32 h, f32 vis) {
     List_View lv = list_begin(app, &app->browse_scroll, ui_id("set.browse"), lp, ls, app->browse_count, row_h, 0);
     for (u32 i = lv.first; i < lv.last; i++) {
         f32 y = lv.y0 + row_h * (f32)i;
-        f32 e = ease_out_cubic(clamp01(appear * 2.5f - (f32)(i - lv.first) * 0.12f));
+        f32 e = core_ease_out_cubic(core_saturate(appear * 2.5f - (f32)(i - lv.first) * 0.12f));
         vec2 rp = vec2_make(lp.x, y), rs = vec2_make(ls.x - S(10), row_h - S(4));
         Ui_Interact it = ui_interact(ui, ui_idx(ui_id("set.dir"), i), rp, rs, PLATFORM_CURSOR_HAND);
         if (it.hover_t > 0.01f) core_draw_rect_rounded(r, rp, rs, S(8), UI_RGBA(139, 102, 255, 0.16f * it.hover_t * vis));
@@ -3050,7 +3012,7 @@ static void draw_settings_browse(App *app, vec2 p, f32 w, f32 h, f32 vis) {
     if (ui->input_enabled && in->key_pressed[PLATFORM_KEY_ENTER]) chosen = true;
     if (chosen) {
         if (app->browse_target == BROWSE_DOWNLOADS) {
-            snprintf(app->settings.download_dir, sizeof(app->settings.download_dir), "%s", app->browse_path);
+            core_cstr_copy(app->settings.download_dir, sizeof(app->settings.download_dir), app->browse_path);
             save_settings(app);
             apply_download_settings(app);
         } else {
@@ -3067,7 +3029,7 @@ static void draw_settings(App *app, vec2 win) {
     const Platform_Input *in = ui->in;
     f32 open = ui_spring(ui, ui_id("set.open"), app->settings_open ? 1.0f : 0.0f, 420, 34);
     if (open < 0.004f && !app->settings_open) return;
-    f32 vis = clamp01(open);
+    f32 vis = core_saturate(open);
     b32 live = app->settings_open && app->menu == MENU_NONE;
 
     core_draw_rect(r, vec2_zero(), win, UI_RGBA(6, 5, 12, 0.5f * vis));
@@ -3096,7 +3058,7 @@ static void draw_settings(App *app, vec2 win) {
 
     /* header: title slides between "Settings" and the picker's title */
     f32 hy = p.y + S(44);
-    f32 pg = clamp01(page);
+    f32 pg = core_saturate(page);
     ui_icon_gear(ui, vec2_make(p.x + S(46) - S(30) * pg, hy), S(24), ui_alpha(UI_LAVENDER, vis * (1 - pg)));
     ui_text(ui, ui->font_semi, core_str_lit("Settings"), p.x + S(70) - S(30) * pg, hy, S(22),
             ui_alpha(UI_TEXT, vis * (1 - pg)), UI_ALIGN_LEFT, 0);
@@ -3189,7 +3151,7 @@ static void demo_token(App *app, char *tok) {
     } else if (strncmp(tok, "key=", 4) == 0) {
         demo_key(app, tok + 4);
     } else if (strncmp(tok, "text=", 5) == 0) {
-        snprintf(app->demo_text, sizeof(app->demo_text), "%s", tok + 5);
+        core_cstr_copy(app->demo_text, sizeof(app->demo_text), tok + 5);
     } else if (strcmp(tok, "dl") == 0) {                 /* open the download page */
         open_search(app, false);
         dlv_start_empty(app->dlv, DL_QUERY_SONG);
@@ -3207,8 +3169,9 @@ static void demo_token(App *app, char *tok) {
         dlv_open(app->dlv, false);
     } else if (strncmp(tok, "search=", 7) == 0) {
         open_search(app, true);
-        u32 n = (u32)strlen(tok + 7);
-        memcpy(app->query, tok + 7, n);
+        Core_String query = core_str_prefix_utf8(core_str(tok + 7), sizeof(app->query));
+        u32 n = (u32)query.len;
+        memcpy(app->query, query.str, n);
         app->query_len = n;
         app->query_hash_done = 0;
         run_search(app);
@@ -3263,7 +3226,7 @@ static void demo_token(App *app, char *tok) {
         if (t) set_liked(app, t->path_hash, true);
     
     } else if (strncmp(tok, "type=", 5) == 0) {
-        snprintf(app->demo_type, sizeof(app->demo_type), "%s", tok + 5);
+        core_cstr_copy(app->demo_type, sizeof(app->demo_type), tok + 5);
         app->demo_typed = 0;
     } else if (strcmp(tok, "open") == 0) {
         open_settings(app, false);
@@ -3310,27 +3273,32 @@ static void demo_token(App *app, char *tok) {
 static void run_demo(App *app) {
     if (!app->demo || !app->lib) return;
     if (!app->demo_cur) {
-        snprintf(app->demo_buf, sizeof(app->demo_buf), "%s", app->demo);
+        core_cstr_copy(app->demo_buf, sizeof(app->demo_buf), app->demo);
         app->demo_cur = app->demo_buf;
     }
     app->demo_frame++;
     if (app->demo_type[app->demo_typed]) {
         if (!app->search_open) app->demo_type[0] = 0; /* palette closed: nothing to type into */
         else {
-            if (app->demo_frame % 5 == 0 && app->query_len < sizeof(app->query))
-                app->query[app->query_len++] = (u8)app->demo_type[app->demo_typed++];
+            if (app->demo_frame % 5 == 0) {
+                Core_String text = core_str(app->demo_type);
+                u32 n = core_utf8_decode(text, app->demo_typed).size;
+                if (n <= sizeof(app->query) - app->query_len) {
+                    memcpy(app->query + app->query_len, text.str + app->demo_typed, n);
+                    app->query_len += n;
+                    app->demo_typed += n;
+                } else app->demo_type[0] = 0;
+            }
             return;
         }
     }
     for (;;) {
         while (*app->demo_cur == ';') app->demo_cur++;
         if (!*app->demo_cur) { app->demo = 0; return; }
-        char *end = strchr(app->demo_cur, ';');
+        const char *end = strchr(app->demo_cur, ';');
         char tok[256];
         u32 n = end ? (u32)(end - app->demo_cur) : (u32)strlen(app->demo_cur);
-        if (n >= sizeof(tok)) n = sizeof(tok) - 1;
-        memcpy(tok, app->demo_cur, n);
-        tok[n] = 0;
+        core_str_write_cstr(tok, sizeof(tok), core_str_n((u8 *)app->demo_cur, n));
         if (tok[0] == '@') {
             if (app->demo_frame < (u32)atoi(tok + 1)) return;
         } else {

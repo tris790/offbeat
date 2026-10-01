@@ -598,7 +598,7 @@ static void set_opaque_region(Platform_Window *w) {
 
 Platform_Window *platform_window_open(const char *title, const char *app_id,
                                       u32 width, u32 height, u32 flags) {
-    Platform_Window *w = calloc(1, sizeof(*w));
+    Platform_Window *w = core_heap_calloc(sizeof(*w));
     if (!w) return 0;
     w->width = width;
     w->height = height;
@@ -621,7 +621,7 @@ Platform_Window *platform_window_open(const char *title, const char *app_id,
     w->display = wl_display_connect(0);
     if (!w->display) {
         fprintf(stderr, "[platform] cannot connect to Wayland display\n");
-        free(w);
+        core_heap_free(w);
         return 0;
     }
 
@@ -706,7 +706,7 @@ void platform_window_close(Platform_Window *w) {
     if (w->xdg_surface)  xdg_surface_destroy(w->xdg_surface);
     if (w->surface)      wl_surface_destroy(w->surface);
     if (w->display)      wl_display_disconnect(w->display);
-    free(w);
+    core_heap_free(w);
 }
 
 b32 platform_window_should_close(Platform_Window *w) { return w->should_close; }

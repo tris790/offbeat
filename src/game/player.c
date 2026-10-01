@@ -20,6 +20,7 @@
  */
 
 #include "player.h"
+#include "../core/string.h"
 #include "../platform/platform.h"
 
 #include "third_party/dr_mp3.h"
@@ -30,7 +31,6 @@
 #include <math.h>
 #include <stdatomic.h>
 #include <string.h>
-#include <strings.h>
 
 #define PLAYER_PATH_MAX        4096
 #define PLAYER_CHUNK_FRAMES    1024    /* frames decoded per step                 */
@@ -319,9 +319,9 @@ static b32 player_dec_open(Player_Decoder *d, const char *path) {
     Player_Codec first = PLAYER_CODEC_NONE;
     const char *ext = strrchr(path, '.');
     if (ext) {
-        if      (!strcasecmp(ext, ".mp3"))                             first = PLAYER_CODEC_MP3;
-        else if (!strcasecmp(ext, ".flac"))                            first = PLAYER_CODEC_FLAC;
-        else if (!strcasecmp(ext, ".ogg") || !strcasecmp(ext, ".oga")) first = PLAYER_CODEC_OGG;
+        if      (core_str_eq_ascii_ci(core_str(ext), core_str_lit(".mp3")))                             first = PLAYER_CODEC_MP3;
+        else if (core_str_eq_ascii_ci(core_str(ext), core_str_lit(".flac")))                            first = PLAYER_CODEC_FLAC;
+        else if (core_str_eq_ascii_ci(core_str(ext), core_str_lit(".ogg")) || core_str_eq_ascii_ci(core_str(ext), core_str_lit(".oga"))) first = PLAYER_CODEC_OGG;
     }
     Player_Codec order[4] = { first, PLAYER_CODEC_FLAC, PLAYER_CODEC_OGG, PLAYER_CODEC_MP3 };
     for (u32 i = 0; i < 4; i++) {
@@ -458,13 +458,6 @@ struct Player {
     f32 pcm[PLAYER_CHUNK_FRAMES * 2];
     f32 out[PLAYER_WRITE_FRAMES * 2];
 };
-
-static void player_copy_path(char *dst, const char *src) {
-    size_t n = strlen(src);
-    if (n >= PLAYER_PATH_MAX) n = PLAYER_PATH_MAX - 1;
-    memcpy(dst, src, n);
-    dst[n] = 0;
-}
 
 static f32 player_rate_step(f64 seconds, u32 rate) {
     return (f32)(1.0 / (seconds * (f64)(rate ? rate : 48000)));
@@ -685,7 +678,7 @@ static void player_preopen_next(Player *p) {
     b32 has    = p->has_next;
     u32 serial = p->next_serial;
     b32 want   = has && serial != p->next_dec_serial;
-    if (want) player_copy_path(p->next_open_path, p->next_path);
+    if (want) core_cstr_copy(p->next_open_path, PLAYER_PATH_MAX, p->next_path);
     platform_mutex_unlock(&p->mutex);
     if (!want) return;
 
@@ -700,7 +693,7 @@ static void player_end_of_stream(Player *p) {
     u64 token  = p->next_token;
     u32 serial = p->next_serial;
     b32 ready  = has && p->next_dec.codec && p->next_dec_serial == serial;
-    if (has && !ready) player_copy_path(p->next_open_path, p->next_path);
+    if (has && !ready) core_cstr_copy(p->next_open_path, PLAYER_PATH_MAX, p->next_path);
     p->has_next = false; /* consumed: the UI sets the following one */
     platform_mutex_unlock(&p->mutex);
 
@@ -722,7 +715,7 @@ static void player_end_of_stream(Player *p) {
         player_dec_close(&p->dec);
         p->dec = nd;
         if (player_sink_for(p, nd.rate)) {
-            player_copy_path(p->path, p->next_open_path);
+            core_cstr_copy(p->path, PLAYER_PATH_MAX, p->next_open_path);
             p->gain_step = player_rate_step(PLAYER_VOLUME_RAMP_S, nd.rate);
             platform_mutex_lock(&p->mutex);
             p->status.advance_count++;
@@ -803,7 +796,7 @@ static void player_thread(void *user) {
             c.play_token  = p->play_token;
             c.play_start  = p->play_start;
             c.play_paused = p->play_paused;
-            player_copy_path(p->path, p->play_path);
+            core_cstr_copy(p->path, PLAYER_PATH_MAX, p->play_path);
         }
         c.stop        = p->cmd_stop;
         c.seek        = p->cmd_seek;
@@ -868,7 +861,7 @@ void player_destroy(Player *p) {
 void player_play_file(Player *p, const char *path, u64 track_token, f64 start_s, b32 start_paused) {
     if (!p || !path) return;
     platform_mutex_lock(&p->mutex);
-    player_copy_path(p->play_path, path);
+    core_cstr_copy(p->play_path, PLAYER_PATH_MAX, path);
     p->cmd_play    = true;
     p->play_token  = track_token;
     p->play_start  = start_s > 0 ? start_s : 0;
@@ -916,7 +909,7 @@ void player_set_next(Player *p, const char *path, u64 track_token) {
     if (!p) return;
     platform_mutex_lock(&p->mutex);
     p->has_next = path != 0;
-    if (path) player_copy_path(p->next_path, path);
+    if (path) core_cstr_copy(p->next_path, PLAYER_PATH_MAX, path);
     p->next_token = path ? track_token : 0;
     p->next_serial++;
     platform_mutex_unlock(&p->mutex);
