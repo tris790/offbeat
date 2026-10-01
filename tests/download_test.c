@@ -64,9 +64,22 @@ static void test_text(void) {
     dl_song_key("Hypnotize feat. Puff Daddy", k2, sizeof(k2));           CHECK_STR(k1, k2);
     dl_song_key("Notorious B.I.G. [2005 Remaster] (feat. Lil' Kim & Puff Daddy)", k1, sizeof(k1));
     dl_song_key("Notorious B.I.G.", k2, sizeof(k2));                     CHECK_STR(k1, k2);
-    dl_song_key("Hypnotize (Live)", k2, sizeof(k2));                     CHECK(strcmp("hypnotize", k2) != 0);
-    dl_song_key("Hypnotize (Remix)", k2, sizeof(k2));                    CHECK(strcmp("hypnotize", k2) != 0);
-    dl_song_key("Hypnotize - Live at Wembley", k2, sizeof(k2));          CHECK(strcmp("hypnotize", k2) != 0);
+    dl_song_key("Hypnotize (Live)", k2, sizeof(k2));                     CHECK_STR(k2, "hypnotize");
+    dl_song_key("Hypnotize (Remix)", k2, sizeof(k2));                    CHECK_STR(k2, "hypnotize");
+    dl_song_key("Hypnotize - Live at Wembley", k2, sizeof(k2));          CHECK_STR(k2, "hypnotize");
+    dl_song_key("God's Bathroom Floor (live in Montreal)", k1, sizeof(k1));
+    dl_song_key("Gods Bathroom Floor (instrumental)", k2, sizeof(k2)); CHECK_STR(k1, k2);
+    dl_song_key("Loyal To The Game (DJ Quik Remix (Explicit))", k1, sizeof(k1));
+    CHECK_STR(k1, "loyaltothegame");
+    dl_song_key("The Woman With the Tattooed Hands Instrumental", k1, sizeof(k1));
+    CHECK_STR(k1, "thewomanwiththetattooedhands");
+    dl_song_key("Sweets (Soda Pop) (extended mix)", k1, sizeof(k1));
+    dl_song_key("Sweets (Soda Pop)", k2, sizeof(k2)); CHECK_STR(k1, k2);
+    dl_song_key("Pista (Fresh Start)", k1, sizeof(k1));
+    dl_song_key("Pista (Great Start)", k2, sizeof(k2)); CHECK(strcmp(k1, k2) != 0);
+    dl_song_key("Live Forever", k1, sizeof(k1)); CHECK_STR(k1, "liveforever");
+    dl_song_key("Song (Live", k1, sizeof(k1)); CHECK_STR(k1, "songlive");
+    dl_song_key("Song", k1, 0); /* zero capacity writes nothing */
     dl_song_key("(Remastered)", k2, sizeof(k2));                         CHECK_STR(k2, "remastered");
     dl_artist_key("The Notorious B.I.G.", k1, sizeof(k1));
     dl_artist_key("notorious big", k2, sizeof(k2));                      CHECK_STR(k1, k2); CHECK_STR(k1, "notoriousbig");

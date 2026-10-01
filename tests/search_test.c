@@ -6,6 +6,7 @@
 #include "core/memory.c"
 #include "core/string.c"
 #include "game/search.c"
+#include "game/filter.c"
 
 #include <stdio.h>
 #include <stdlib.h>

@@ -1939,13 +1939,10 @@ static const u32 *game_panel_filter_results(App *app, s32 scope, const u32 *sour
         app->filter_count = 0;
         for (u32 i = 0; i < total; i++) {
             u32 index = source ? source[i] : i;
-            Core_String fields[3];
-            u32 n = 1;
-            if (source) {
-                const Lib_Track *t = &app->lib->tracks[index];
-                fields[0] = t->title; fields[1] = t->artist; fields[2] = t->album; n = 3;
-            } else fields[0] = scope == TAB_ARTISTS ? app->lib->artists[index].name : app->lib->genres[index].name;
-            if (game_filter_matches(&query, fields, n)) app->filter_indices[app->filter_count++] = index;
+            Core_String name;
+            if (scope == TAB_SONGS || scope >= TAB_COUNT) name = app->lib->tracks[index].title;
+            else name = scope == TAB_ARTISTS ? app->lib->artists[index].name : app->lib->genres[index].name;
+            if (game_filter_matches(&query, &name, 1)) app->filter_indices[app->filter_count++] = index;
         }
         app->filter_cached_scope = scope;
         app->filter_cached_source = source;
@@ -2356,6 +2353,15 @@ static void palette_run_action(App *app, u32 act) {
 #define PALETTE_W 654 /* 545 * 1.2 */
 #define PALETTE_IW (PALETTE_W - 54) /* content width inside the 29px side padding */
 
+/* Only keyboard navigation follows the selection. Wheel scrolling may leave
+   it offscreen while the animated list catches up to its target. */
+static void game_palette_select(App *app, s32 row) {
+    app->hit_sel = row;
+    f32 top = (f32)row;
+    if (top < app->hit_scroll) app->hit_scroll = top;
+    if (top > app->hit_scroll + 3) app->hit_scroll = top - 3;
+}
+
 static void draw_palette(App *app, vec2 win) {
     Ui *ui = &app->ui;
     Core_Renderer *r = app->r;
@@ -2390,10 +2396,10 @@ static void draw_palette(App *app, vec2 win) {
         s32 total = (s32)(app->hit_count + nacts);
         if (in->key_pressed[PLATFORM_KEY_DOWN] || (in->key_pressed[PLATFORM_KEY_TAB] && !in->shift) ||
             (in->ctrl && in->key_pressed[PLATFORM_KEY_N]))
-            app->hit_sel = (app->hit_sel + 1) % total;
+            game_palette_select(app, (app->hit_sel + 1) % total);
         if (in->key_pressed[PLATFORM_KEY_UP] || (in->key_pressed[PLATFORM_KEY_TAB] && in->shift) ||
             (in->ctrl && in->key_pressed[PLATFORM_KEY_P]))
-            app->hit_sel = (app->hit_sel + total - 1) % total;
+            game_palette_select(app, (app->hit_sel + total - 1) % total);
         if (in->key_pressed[PLATFORM_KEY_ENTER]) {
             if (app->hit_sel < (s32)app->hit_count) {
                 search_play(app, app->hits[app->hit_sel].track, in->shift);
@@ -2468,12 +2474,6 @@ static void draw_palette(App *app, vec2 win) {
     f32 ry0 = PY(101);
     f32 row_h = S(67) * s;
     f32 appear = ui_ease(ui, ui_id("pal.results"), 1.0f, 7.0f);
-    /* keep selection visible */
-    if (app->hit_sel >= 0) {
-        f32 sel_top = (f32)app->hit_sel;
-        if (sel_top < app->hit_scroll) app->hit_scroll = sel_top;
-        if (sel_top > app->hit_scroll + 3) app->hit_scroll = sel_top - 3;
-    }
     if (ui_mouse_in(ui, vec2_make(p.x, ry0), vec2_make(w2, rows_h * s)) && in->scroll_y != 0 && total_rows > 4) {
         app->hit_scroll = CORE_CLAMP(app->hit_scroll - in->scroll_y, 0.0f, (f32)(total_rows - 4));
     }
@@ -3276,7 +3276,7 @@ static void demo_token(App *app, char *tok) {
         open_settings(app, false);
         app->menu = MENU_NONE;
     } else if (strcmp(tok, "down") == 0) {
-        if (app->hit_count) app->hit_sel = (app->hit_sel + 1) % (s32)app->hit_count;
+        if (app->hit_count) game_palette_select(app, (app->hit_sel + 1) % (s32)app->hit_count);
     } else if (strcmp(tok, "enter") == 0) {
         if (app->hit_count) search_play(app, app->hits[app->hit_sel].track, false);
         open_search(app, false);

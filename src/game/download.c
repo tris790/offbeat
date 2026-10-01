@@ -242,6 +242,42 @@ static b32 release_tags(const char *s, size_t len) {
     return any;
 }
 
+/* Recording variants belong to the same song family. Keep unknown subtitles:
+   "Sweets (Soda Pop)" and "Pista (Fresh Start)" are meaningful title text. */
+static b32 variant_tags(const char *s, size_t len) {
+    static const char *const markers[] = {
+        "instrumental", "acapella", "accapella", "cappella", "acoustic", "live",
+        "remix", "mix", "edit", "edited", "cleaned", "dirty", "karaoke", "demo",
+        "vip", "vocal", "radio", "extended", "remaster", "remastered",
+    };
+    if (release_tags(s, len)) return true;
+    for (size_t i = 0; i < len;) {
+        while (i < len && !isalnum((u8)s[i])) i++;
+        size_t st = i;
+        while (i < len && isalnum((u8)s[i])) i++;
+        size_t n = i - st;
+        for (u32 j = 0; j < CORE_ARRAY_COUNT(markers); j++)
+            if (strlen(markers[j]) == n && !strncasecmp(s + st, markers[j], n)) return true;
+    }
+    return false;
+}
+
+/* Balanced brackets, including nested release labels. */
+static size_t song_group_end(const char *s, size_t start) {
+    char stack[64];
+    u32 depth = 0;
+    for (size_t i = start; s[i]; i++) {
+        if (s[i] == '(' || s[i] == '[') {
+            if (depth == CORE_ARRAY_COUNT(stack)) return start;
+            stack[depth++] = s[i] == '(' ? ')' : ']';
+        } else if (s[i] == ')' || s[i] == ']') {
+            if (!depth || s[i] != stack[depth - 1]) return start;
+            if (--depth == 0) return i;
+        }
+    }
+    return start;
+}
+
 /* "feat. X & Y": a credit, not part of the song's name. */
 static b32 credit_words(const char *s, size_t len) {
     size_t i = 0;
@@ -262,25 +298,29 @@ static u32 fold_append(const char *s, char *out, u32 w, u32 cap) {
 }
 
 void dl_song_key(const char *title, char *out, u32 cap) {
+    if (!cap) return;
     char t[DL_TEXT * 2];
     copy_to(t, sizeof(t), title);
     /* " - Remastered 2011" / " - Single Version" / " feat. X" tails */
     char *dash = 0;
     for (char *p = t; (p = strstr(p, " - ")) != 0; p += 3) dash = p;
-    if (dash && release_tags(dash + 3, strlen(dash + 3))) *dash = 0;
+    if (dash && variant_tags(dash + 3, strlen(dash + 3))) *dash = 0;
     static const char *const feats[] = { " feat. ", " feat ", " ft. ", " ft ", " featuring " };
     for (u32 i = 0; i < CORE_ARRAY_COUNT(feats); i++) {
         size_t fl = strlen(feats[i]);
         for (char *p = t; *p; p++)
             if (strncasecmp(p, feats[i], fl) == 0) { *p = 0; break; }
     }
+    static const char *const tails[] = { " instrumental", " acapella", " accapella", " a cappella", " radio edit" };
+    for (u32 i = 0; i < CORE_ARRAY_COUNT(tails); i++)
+        if (strlen(t) > strlen(tails[i]) && ci_suffix(t, tails[i])) t[strlen(t) - strlen(tails[i])] = 0;
     u32 w = 0;
     for (size_t i = 0; t[i] && w + 1 < cap; i++) {
         u8 c = (u8)t[i];
         if (c == '(' || c == '[') {
-            const char *e = strchr(t + i + 1, c == '(' ? ')' : ']');
-            if (e && (credit_words(t + i + 1, (size_t)(e - t - i - 1)) || release_tags(t + i + 1, (size_t)(e - t - i - 1))))
-                i = (size_t)(e - t); /* the whole tag goes; other brackets keep their words */
+            size_t end = song_group_end(t, i);
+            if (end > i && (credit_words(t + i + 1, end - i - 1) || variant_tags(t + i + 1, end - i - 1)))
+                i = end;
             continue;
         }
         if (isalnum(c) || c >= 0x80) out[w++] = (char)tolower(c);

@@ -6,12 +6,13 @@
 /*
  * Fuzzy track search for the command palette.
  *
- * The query is split on spaces; every word must match at least one of the
+ * The query is split on whitespace; every word must match at least one of the
  * track's title, artist or album ("one more daft" finds Daft Punk - One More
  * Time). Each word is scored against each field, keeping the best (title >
  * artist > album at equal quality), and the track's score is the mean of its
  * words. The best `max_results` are kept in a small sorted array -- no
- * allocation, O(tracks * len).
+ * allocation, O(tracks * words * len). Uses the same compiled query and
+ * per-field fuzzy matcher as the tab filters.
  *
  * Matching is case-insensitive and accent-folded for Latin text, so "rufus"
  * finds "RUFUS DU SOL". Per field, ranking is: prefix, word-start match,
@@ -41,7 +42,7 @@ typedef struct {
 /* Returns the number of hits written to `out` (sorted by score, best first). */
 u32 search_tracks(const Library *lib, Core_String query, Search_Hit *out, u32 max_results);
 
-/* Fold one codepoint to a lowercase ASCII-ish byte for matching (0 = skip). */
+/* Fold Latin text to lowercase ASCII-ish bytes; 0xFF = preserve codepoint. */
 u8 search_fold(u32 cp);
 
 #endif /* GAME_SEARCH_H */
