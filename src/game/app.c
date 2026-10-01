@@ -21,6 +21,7 @@
 #include "filter.h"
 #include "library.h"
 #include "player.h"
+#include "queue.h"
 #include "search.h"
 #include "settings.h"
 #include "ui.h"
@@ -149,6 +150,7 @@ struct App {
     u32  menu_track;
     s32  menu_queue_index;     /* >= 0 when opened on a queue row */
     b32  menu_artist_actions;  /* track menu also offers "queue artist" (palette) */
+    b32  menu_delete_failed;
     u32  menu_artist;          /* Library.artists index for MENU_ARTIST */
     u32  menu_genre;           /* Library.genres index for MENU_GENRE */
     vec2 menu_pos;
@@ -514,6 +516,7 @@ static void restore_session(App *app);
 /* Swap in a new snapshot, remapping the queue by path hash. */
 static void adopt_library(App *app, Library *nl) {
     Library *old = app->lib;
+    b32 queue_was_empty = old && app->queue_len == 0;
     if (old && app->queue_len) {
         u32 w = 0;
         s32 new_cur = -1;
@@ -532,6 +535,7 @@ static void adopt_library(App *app, Library *nl) {
         app->cur = new_cur >= 0 ? new_cur : (w ? 0 : -1);
     }
     app->lib = nl;
+    app->menu = MENU_NONE; /* menu indices belonged to the old snapshot */
     app->filter_cached_scope = -1;
     app->filter_focus = -1;
     app->filters[TAB_COUNT] = (Panel_Filter){0};
@@ -543,7 +547,7 @@ static void adopt_library(App *app, Library *nl) {
         else library_free(old);
     }
     if (app->session_pending) restore_session(app);
-    else if (app->queue_len == 0 && nl->track_count) {
+    else if (!queue_was_empty && app->queue_len == 0 && nl->track_count) {
         queue_set(app, nl->by_title, nl->track_count, 0);
     }
     /* the loaded file left the library (e.g. the music folder changed):
@@ -669,6 +673,31 @@ static void rescan_library(App *app) {
     }
     app->rescan_at = 0;
     app->scanner = library_scan_start(app->music_dir, app->index_path, app->lib);
+}
+
+static b32 game_delete_song(App *app, u32 track) {
+    const Lib_Track *t = track_at(app, track);
+    if (!t) return false;
+    if (!platform_file_remove((const char *)t->path.str)) {
+        fprintf(stderr, "Could not delete song: %s\n", t->path.str);
+        return false;
+    }
+
+    Player_Status st = player_status(app->player);
+    b32 removed_current = game_queue_remove_track(app->queue, app->queue_orig,
+                                                  &app->queue_len, &app->cur, track);
+    if (removed_current || app->playing_hash == t->path_hash) {
+        player_stop(app->player);
+        app->playing_hash = 0;
+        app->seen_advance = player_status(app->player).advance_count;
+        if (app->cur >= 0) play_index(app, app->cur, 0, !st.loaded || st.paused || st.ended);
+    }
+    set_liked(app, t->path_hash, false);
+    app->next_sent = false;
+    sync_next(app);
+    app->state_dirty = true;
+    rescan_library(app);
+    return true;
 }
 
 /* Switch the library root. The rescan reuses unchanged tracks and drops the
@@ -1616,6 +1645,7 @@ static void open_menu(App *app, u32 track, s32 queue_index, b32 artist_actions) 
     app->menu_track = track;
     app->menu_queue_index = queue_index;
     app->menu_artist_actions = artist_actions;
+    app->menu_delete_failed = false;
     app->menu_pos = app->ui.in->mouse_pos;
     ui_anim_set(&app->ui, ui_id("menu.t"), 0);
 }
@@ -2548,7 +2578,7 @@ static void draw_palette(App *app, vec2 win) {
 /* context menu                                                              */
 /* ------------------------------------------------------------------------- */
 
-enum { ACT_NEXT, ACT_QUEUE, ACT_REMOVE, ACT_ARTIST_NEXT, ACT_ARTIST_QUEUE, ACT_GENRE_NEXT, ACT_GENRE_QUEUE, ACT_DL_ARTIST };
+enum { ACT_NEXT, ACT_QUEUE, ACT_REMOVE, ACT_DELETE, ACT_ARTIST_NEXT, ACT_ARTIST_QUEUE, ACT_GENRE_NEXT, ACT_GENRE_QUEUE, ACT_DL_ARTIST };
 
 /* The artist a menu is about (track menus: the track's artist), or 0 when
    there is no real one to look up ("Unknown Artist"). */
@@ -2582,6 +2612,7 @@ static void draw_menu(App *app, vec2 win) {
     f32 t = ui_spring(ui, ui_id("menu.t"), 1.0f, 520, 32);
     static const char *const labels[] = {
         [ACT_NEXT] = "Play next", [ACT_QUEUE] = "Add to queue", [ACT_REMOVE] = "Remove from queue",
+        [ACT_DELETE] = "Delete from disk",
         [ACT_ARTIST_NEXT] = "Play artist next", [ACT_ARTIST_QUEUE] = "Queue all from artist",
         [ACT_GENRE_NEXT] = "Play genre next", [ACT_GENRE_QUEUE] = "Queue all from genre",
         [ACT_DL_ARTIST] = "Download top 100 by artist",
@@ -2593,6 +2624,7 @@ static void draw_menu(App *app, vec2 win) {
     if (app->menu == MENU_TRACK && app->menu_queue_index >= 0) acts[n++] = ACT_REMOVE;
     if (app->menu == MENU_TRACK && app->menu_artist_actions) { acts[n++] = ACT_ARTIST_QUEUE; acts[n++] = ACT_ARTIST_NEXT; }
     if (menu_artist_of(app)) acts[n++] = ACT_DL_ARTIST;
+    if (app->menu == MENU_TRACK) acts[n++] = ACT_DELETE;
     f32 w = S(252), ih = S(38);
     f32 h = ih * (f32)n + S(12);
     vec2 p = app->menu_pos;
@@ -2614,11 +2646,14 @@ static void draw_menu(App *app, vec2 win) {
         if (it.hover_t > 0.01f) core_draw_rect_rounded(r, ip, is, S(7), UI_RGBA(139, 102, 255, 0.22f * it.hover_t));
         vec2 ic = vec2_make(ip.x + S(18), ip.y + is.y * 0.5f);
         vec4 col = ui_alpha(ui_mix(UI_RGBA(215, 210, 235, 1), UI_TEXT, it.hover_t), clamp01(t));
+        if (act == ACT_DELETE) col = ui_alpha(UI_RGBA(255, 135, 145, 1), clamp01(t));
         if (act == ACT_NEXT || act == ACT_ARTIST_NEXT || act == ACT_GENRE_NEXT) ui_icon_queue_next(ui, ic, S(16), col);
         else if (act == ACT_QUEUE || act == ACT_ARTIST_QUEUE || act == ACT_GENRE_QUEUE) ui_icon_plus(ui, ic, S(16), col);
         else if (act == ACT_DL_ARTIST) ui_icon_download(ui, ic, S(17), col);
+        else if (act == ACT_DELETE) ui_icon_close(ui, ic, S(16), col);
         else ui_icon_minus(ui, ic, S(16), col);
-        ui_text(ui, ui->font, core_str(labels[act]), ip.x + S(38), ic.y, S(14), col, UI_ALIGN_LEFT, 0);
+        const char *label = act == ACT_DELETE && app->menu_delete_failed ? "Delete failed (retry)" : labels[act];
+        ui_text(ui, ui->font, core_str(label), ip.x + S(38), ic.y, S(14), col, UI_ALIGN_LEFT, 0);
         if (it.clicked) {
             const Lib_Artist *a = 0;
             const Lib_Genre *g = 0;
@@ -2641,6 +2676,10 @@ static void draw_menu(App *app, vec2 win) {
             case ACT_NEXT:         queue_insert_next(app, app->menu_track); break;
             case ACT_QUEUE:        queue_append(app, app->menu_track); break;
             case ACT_REMOVE:       queue_remove(app, (u32)app->menu_queue_index); break;
+            case ACT_DELETE:
+                app->menu_delete_failed = !game_delete_song(app, app->menu_track);
+                if (app->menu_delete_failed) continue;
+                break;
             case ACT_ARTIST_NEXT:  if (a) queue_insert_next_many(app, a->tracks, a->track_count); break;
             case ACT_ARTIST_QUEUE: if (a) queue_append_many(app, a->tracks, a->track_count); break;
             case ACT_GENRE_NEXT:   if (g) queue_insert_next_many(app, g->tracks, g->track_count); break;
