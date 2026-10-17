@@ -448,6 +448,7 @@ struct Player {
     Platform_Audio *sink;
     Player_Run      run;
     b32             ended;
+    b32             waiting_next;    /* natural EOF can accept a late UI handoff */
     b32             want_mark;       /* record dbg_cmd_latency at next write  */
     char            path[PLAYER_PATH_MAX];
     char            next_open_path[PLAYER_PATH_MAX];
@@ -517,6 +518,7 @@ static void player_do_open(Player *p, u64 token, f64 start_s, b32 paused) {
     p->pcm_pos = p->pcm_len = 0;
     p->run   = PLAYER_RUN_IDLE;
     p->ended = false;
+    p->waiting_next = false;
 
     b32 ok = player_dec_open(&p->dec, p->path);
     f64 t1 = platform_time_seconds();
@@ -560,6 +562,7 @@ static void player_do_stop(Player *p) {
     p->pcm_pos = p->pcm_len = 0;
     p->run   = PLAYER_RUN_IDLE;
     p->ended = false;
+    p->waiting_next = false;
 
     platform_mutex_lock(&p->mutex);
     if (!p->cmd_play) {
@@ -586,6 +589,7 @@ static void player_do_seek(Player *p, f64 seconds) {
     player_dec_seek(d, frame);
 
     p->ended = false;
+    p->waiting_next = false;
     if (p->run == PLAYER_RUN_PAUSING) p->run = PLAYER_RUN_IDLE; /* the drop silenced it */
     p->fade        = 0;
     p->fade_target = 1;
@@ -604,6 +608,7 @@ static void player_do_seek(Player *p, f64 seconds) {
 }
 
 static void player_do_pause(Player *p, b32 paused) {
+    p->waiting_next = false; /* an explicit transport command ends the handoff */
     if (paused) {
         if (p->run == PLAYER_RUN_PLAYING) {
             p->run         = PLAYER_RUN_PAUSING;
@@ -723,10 +728,14 @@ static void player_end_of_stream(Player *p) {
             if (!p->cmd_play) {
                 p->status.track_token = token;
                 player_publish_loaded(p);
+                if (p->waiting_next && !p->cmd_pause) p->status.paused = false;
                 p->pos_running = true;
                 p->gen++;
             }
             platform_mutex_unlock(&p->mutex);
+            if (p->waiting_next) p->run = PLAYER_RUN_PLAYING;
+            p->ended = false;
+            p->waiting_next = false;
             return;
         }
         player_dec_close(&p->dec);
@@ -734,6 +743,7 @@ static void player_end_of_stream(Player *p) {
 
     /* Nothing to continue with: let the tail play out and stop at the end. */
     if (p->sink) platform_audio_drain(p->sink);
+    p->waiting_next = !has && p->run == PLAYER_RUN_PLAYING;
     p->run   = PLAYER_RUN_IDLE;
     p->ended = p->dec.codec != PLAYER_CODEC_NONE;
     platform_mutex_lock(&p->mutex);
@@ -787,10 +797,12 @@ static void player_thread(void *user) {
     for (;;) {
         Player_Cmd c = {0};
         platform_mutex_lock(&p->mutex);
-        while (!p->quit && !player_cmd_pending(p) && p->run == PLAYER_RUN_IDLE && !p->dec.scan) {
+        while (!p->quit && !player_cmd_pending(p) && p->run == PLAYER_RUN_IDLE && !p->dec.scan &&
+               !(p->waiting_next && p->has_next)) {
             platform_cond_wait(&p->cond, &p->mutex);
         }
         b32 quit = p->quit;
+        b32 continue_next = p->waiting_next && p->has_next;
         if (p->cmd_play) {
             c.play        = true;
             c.play_token  = p->play_token;
@@ -814,6 +826,7 @@ static void player_thread(void *user) {
         if (c.play)  player_do_open(p, c.play_token, c.play_start, c.play_paused);
         if (c.seek)  player_do_seek(p, c.seek_s);
         if (c.pause) player_do_pause(p, c.pause_value);
+        if (continue_next && p->waiting_next) player_end_of_stream(p);
 
         if (p->run != PLAYER_RUN_IDLE) {
             player_step(p);
@@ -912,6 +925,7 @@ void player_set_next(Player *p, const char *path, u64 track_token) {
     if (path) core_cstr_copy(p->next_path, PLAYER_PATH_MAX, path);
     p->next_token = path ? track_token : 0;
     p->next_serial++;
+    platform_cond_signal(&p->cond);
     platform_mutex_unlock(&p->mutex);
 }
 

@@ -551,6 +551,12 @@ static b32 egl_create_context(Platform_Window *w, EGLint surface_bit) {
 }
 
 static b32 egl_setup(Platform_Window *w) {
+    /* NVIDIA egl-wayland2 (1.0.2, driver 615) never dispatches the
+       wl_buffer.release events of its swapchain buffers when presenting with
+       explicit sync: libwayland queues ~200 bytes per frame forever (GBs per
+       day at 60 fps). Implicit sync dispatches them. Must be set before the
+       EGL platform library initializes the display; an explicit user value wins. */
+    platform_env_set("__NV_DISABLE_EXPLICIT_SYNC", "1", false);
     w->egl_display = eglGetDisplay((EGLNativeDisplayType)w->display);
     if (w->egl_display == EGL_NO_DISPLAY) return false;
     if (!egl_create_context(w, EGL_WINDOW_BIT)) return false;

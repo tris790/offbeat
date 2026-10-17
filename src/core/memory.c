@@ -8,6 +8,7 @@
 static _Atomic u64 g_arena_committed;
 static _Atomic u64 g_heap_live;
 static _Atomic u64 g_heap_peak;
+static _Atomic u64 g_heap_blocks;
 
 #define CORE_ARENA_COMMIT_CHUNK CORE_MB(1)
 
@@ -80,6 +81,7 @@ typedef union { u64 size; long double align; } Core_HeapHeader;
 #define HEAP_HDR sizeof(Core_HeapHeader)
 
 static void core_heap_note_alloc(u64 size) {
+    atomic_fetch_add(&g_heap_blocks, 1);
     u64 live = atomic_fetch_add(&g_heap_live, size) + size;
     u64 peak = atomic_load(&g_heap_peak);
     while (live > peak && !atomic_compare_exchange_weak(&g_heap_peak, &peak, live)) {}
@@ -112,6 +114,7 @@ void *core_heap_realloc(void *ptr, u64 size) {
     if (!p) return 0;
     *(u64 *)p = size;
     atomic_fetch_sub(&g_heap_live, old);
+    atomic_fetch_sub(&g_heap_blocks, 1);
     core_heap_note_alloc(size);
     return p + HEAP_HDR;
 }
@@ -120,6 +123,7 @@ void core_heap_free(void *ptr) {
     if (!ptr) return;
     u8 *base = (u8 *)ptr - HEAP_HDR;
     atomic_fetch_sub(&g_heap_live, *(u64 *)base);
+    atomic_fetch_sub(&g_heap_blocks, 1);
     free(base);
 }
 
@@ -128,5 +132,6 @@ Core_MemStats core_mem_stats(void) {
         .arena_committed = atomic_load(&g_arena_committed),
         .heap_live       = atomic_load(&g_heap_live),
         .heap_peak       = atomic_load(&g_heap_peak),
+        .heap_blocks     = atomic_load(&g_heap_blocks),
     };
 }

@@ -43,8 +43,10 @@ int main(void) {
     u8 *grown = core_heap_realloc(p, 128);
     CHECK(grown && grown[31] == 7);
     CHECK(core_mem_stats().heap_live == before.heap_live + 128);
+    CHECK(core_mem_stats().heap_blocks == before.heap_blocks + 1); /* realloc moves, not adds */
     core_heap_free(grown);
     CHECK(core_mem_stats().heap_live == before.heap_live);
+    CHECK(core_mem_stats().heap_blocks == before.heap_blocks);
     u32 rng = 1;
     CHECK(core_rng_next(&rng) == 270369);
     CHECK(core_rng_next(&rng) == 67634689);

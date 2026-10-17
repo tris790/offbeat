@@ -324,6 +324,42 @@ static void test_player(void) {
         TEST_CHECK(fabs(s.position_s - 30.0) < 0.05);
     }
 
+    /* The UI can be delayed past the end of the automatically opened track.
+       Supplying its successor must wake the idle audio thread and continue. */
+    {
+        u64 ac = player_status(p).advance_count;
+        lc = player_status(p).load_count;
+        player_play_file(p, a, 10, 1e6, false);
+        player_set_next(p, b, 20);
+        s = test_wait_status(p, 3.0, test_is_advanced, ac);
+        TEST_CHECK(s.advance_count == ac + 1 && s.track_token == 20 && !s.paused);
+        player_seek(p, s.duration_s);
+        s = test_wait_status(p, 3.0, test_is_ended, 0);
+        TEST_CHECK(s.ended && s.paused && !s.error && s.track_token == 20);
+        platform_sleep(0.1); /* ensure the thread is asleep before the handoff */
+        player_set_next(p, a, 30);
+        s = test_wait_status(p, 2.0, test_is_advanced, ac + 1);
+        TEST_CHECK(s.advance_count == ac + 2 && s.load_count == lc + 3);
+        TEST_CHECK(s.track_token == 30 && s.loaded && !s.paused && !s.ended && !s.error);
+        platform_sleep(0.15);
+        TEST_CHECK(player_status(p).position_s > 0.05);
+
+        /* Clearing next keeps EOF idle; an explicit pause cancels recovery. */
+        player_seek(p, s.duration_s);
+        s = test_wait_status(p, 3.0, test_is_ended, 0);
+        TEST_CHECK(s.ended && s.track_token == 30);
+        player_set_next(p, 0, 0);
+        platform_sleep(0.1);
+        s = player_status(p);
+        TEST_CHECK(s.ended && s.advance_count == ac + 2);
+        player_set_paused(p, true);
+        player_set_next(p, b, 40);
+        platform_sleep(0.15);
+        s = player_status(p);
+        TEST_CHECK(s.ended && s.paused && s.track_token == 30 && s.advance_count == ac + 2);
+        player_set_next(p, 0, 0);
+    }
+
     /* broken file */
     {
         lc = player_status(p).load_count;

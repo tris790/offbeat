@@ -14,12 +14,17 @@
  * Headless recording (README gifs): every frame is written as raw RGBA to a
  * file or fifo, at real-time pace (audio-driven visuals stay in sync):
  *   OFFBEAT_REC=/tmp/rec.fifo OFFBEAT_SHOT_FRAMES=1800 ./build/offbeat
+ *
+ * Memory soak log (leak hunting): appends one CSV row every N seconds with
+ * process RSS next to the app's tracked arena/heap counters:
+ *   OFFBEAT_MEMLOG=/tmp/mem.csv [OFFBEAT_MEMLOG_INTERVAL=10] ./build/offbeat
  */
 
 #include "core/types.h"
 #include "core/memory.h"
 #include "core/renderer.h"
 #include "platform/platform.h"
+#include "platform/memory.h"
 #include "game/app.h"
 
 #include "third_party/stb_image_write.h"
@@ -52,6 +57,7 @@ static void window_state_load(Core_Arena *arena, const char *path, u32 *w, u32 *
 
 int main(void)
 {
+    if (!platform_memory_tune_heap()) fprintf(stderr, "warning: allocator tuning failed\n");
     const char *shot = platform_env("OFFBEAT_SHOT");
     const char *rec = platform_env("OFFBEAT_REC");
     b32 headless = shot || rec;
@@ -113,6 +119,14 @@ int main(void)
         rec_px = core_heap_alloc((u64)win_w * win_h * 4);
     }
 
+    const char *memlog_path = platform_env("OFFBEAT_MEMLOG");
+    FILE *memlog = memlog_path ? fopen(memlog_path, "a") : 0;
+    f64 memlog_every = platform_env("OFFBEAT_MEMLOG_INTERVAL") ? atof(platform_env("OFFBEAT_MEMLOG_INTERVAL")) : 10.0;
+    if (memlog_every <= 0) memlog_every = 10.0;
+    f64 memlog_start = platform_time_seconds(), memlog_next = memlog_start;
+    u32 memlog_frame = 0, memlog_swaps = 0, swaps = 0;
+    if (memlog) fprintf(memlog, "t_s,frames,swaps,busy,rss_kb,anon_kb,file_kb,arena_kb,heap_kb,heap_blocks,heap_peak_kb\n");
+
     Platform_Input input = {0};
     f64 last = platform_time_seconds();
     u32 frame = 0;
@@ -141,9 +155,30 @@ int main(void)
         if (headless) dt = 1.0f / 60.0f;    /* deterministic animation */
         if (dt > 0.1f) dt = 0.1f;           /* after a sleep: no huge jumps */
 
+        b32 was_busy = busy;
         busy = app_frame(app, &input, dt, win_w, win_h);
-        platform_swap_buffers(win);
+        /* Present only for input, active animation/work, or its final frame.
+           Swapping an unchanged Wayland/EGL surface can retain driver memory. */
+        if (was_busy || busy || input.any_event) {
+            platform_swap_buffers(win);
+            swaps++;
+        }
         frame++;
+
+        if (memlog && now >= memlog_next) {
+            Core_MemStats ms = core_mem_stats();
+            Platform_MemInfo pm = platform_mem_info();
+            fprintf(memlog, "%.0f,%u,%u,%d,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n", now - memlog_start,
+                    frame - memlog_frame, swaps - memlog_swaps, busy ? 1 : 0,
+                    (unsigned long long)(pm.rss >> 10), (unsigned long long)(pm.rss_anon >> 10),
+                    (unsigned long long)(pm.rss_file >> 10), (unsigned long long)(ms.arena_committed >> 10),
+                    (unsigned long long)(ms.heap_live >> 10), (unsigned long long)ms.heap_blocks,
+                    (unsigned long long)(ms.heap_peak >> 10));
+            fflush(memlog);
+            memlog_frame = frame;
+            memlog_swaps = swaps;
+            memlog_next = now + memlog_every;
+        }
 
         if (rec) {
             core_renderer_read_pixels(renderer, win_w, win_h, rec_px);
@@ -167,6 +202,7 @@ int main(void)
     }
 
     if (rec_out) fclose(rec_out);
+    if (memlog) fclose(memlog);
     app_shutdown(app); /* also creates the config dir */
 
     if (!headless && state_path[0]) {

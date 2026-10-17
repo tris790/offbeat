@@ -77,6 +77,22 @@ CORE_INLINE f32 core_move_toward(f32 current, f32 target, f32 max_delta) {
     if (core_f32_abs(d) <= max_delta) return target;
     return current + (d < 0.0f ? -max_delta : max_delta);
 }
+/* Exponential approach: *value moves the fraction k of the way to target and
+   snaps once within eps. Far from zero (pixel positions, long scroll offsets)
+   at high frame rates the step can round away entirely while still more than
+   eps from target; such a stall also snaps, within a magnitude-relative bound,
+   instead of never settling. Returns true while still moving. */
+CORE_INLINE b32 core_approach(f32 *value, f32 target, f32 k, f32 eps) {
+    f32 before = *value;
+    *value += (target - *value) * k;
+    f32 dist = core_f32_abs(target - *value);
+    b32 stalled = *value == before && k > 0.0f && dist < core_f32_max(eps, core_f32_abs(target) * 1e-5f);
+    if (dist < eps || stalled) {
+        *value = target;
+        return false;
+    }
+    return true;
+}
 CORE_INLINE f32 core_wrap(f32 x, f32 period) {
     if (period <= 0.0f) return 0.0f;
     x = fmodf(x, period);

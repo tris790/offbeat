@@ -11,4 +11,8 @@ void *platform_memory_reserve(u64 size);
 b32   platform_memory_commit(void *base, u64 size);
 void  platform_memory_release(void *base, u64 size);
 
+/* Tune the process allocator for a long-running app; call before any thread
+   starts. Returns false if the C library rejected the settings. */
+b32   platform_memory_tune_heap(void);
+
 #endif

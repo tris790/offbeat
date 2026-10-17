@@ -1,5 +1,8 @@
 #include "memory.h"
 
+#ifdef __GLIBC__
+#include <malloc.h>
+#endif
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -20,4 +23,19 @@ b32 platform_memory_commit(void *base, u64 size) {
 
 void platform_memory_release(void *base, u64 size) {
     munmap(base, size);
+}
+
+/* glibc grows extra arenas when threads contend (cover workers, audio) and
+   raises its mmap threshold after large frees, so freed multi-MB decode
+   buffers stayed resident in each arena (~400 MB/day of free-but-retained
+   memory while playing). One arena plus a fixed threshold returns large
+   buffers to the OS on free. */
+b32 platform_memory_tune_heap(void) {
+#ifdef __GLIBC__
+    b32 ok = mallopt(M_ARENA_MAX, 1) == 1;
+    ok = (mallopt(M_MMAP_THRESHOLD, 256 * 1024) == 1) && ok;
+    return ok;
+#else
+    return true;
+#endif
 }

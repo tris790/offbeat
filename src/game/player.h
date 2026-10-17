@@ -32,7 +32,9 @@ void player_play_file(Player *p, const char *path, u64 track_token,
                       f64 start_s, b32 start_paused);
 /* Stop and unload the current stream (and drop `next`). */
 void player_stop(Player *p);
-/* File to continue with when the current one ends. path=0 clears it. */
+/* File to continue with when the current one ends. path=0 clears it.
+   A late handoff also continues after natural EOF, unless an explicit
+   play/stop/seek/pause command has since changed the transport. */
 void player_set_next(Player *p, const char *path, u64 track_token);
 void player_set_paused(Player *p, b32 paused);
 void player_seek(Player *p, f64 seconds);

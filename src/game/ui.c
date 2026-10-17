@@ -137,10 +137,7 @@ f32 ui_ease(Ui *ui, u64 id, f32 target, f32 rate) {
     b32 created;
     Ui_Anim *a = anim_slot(ui, id, target, &created);
     if (created) return target;
-    f32 k = 1.0f - expf(-rate * ui->dt);
-    a->value += (target - a->value) * k;
-    if (fabsf(target - a->value) < 0.0005f) a->value = target;
-    else ui->animating = true;
+    if (core_approach(&a->value, target, 1.0f - expf(-rate * ui->dt), 0.0005f)) ui->animating = true;
     return a->value;
 }
 
@@ -154,12 +151,19 @@ f32 ui_spring(Ui *ui, u64 id, f32 target, f32 stiffness, f32 damping) {
     if (steps < 1) steps = 1;
     if (steps > 16) steps = 16;
     f32 h = dt / (f32)steps;
+    f32 before = a->value;
     for (u32 s = 0; s < steps; s++) {
         f32 force = (target - a->value) * stiffness - a->velocity * damping;
         a->velocity += force * h;
         a->value += a->velocity * h;
     }
-    if (fabsf(target - a->value) < 0.0005f && fabsf(a->velocity) < 0.005f) {
+    /* At large magnitudes (pixel positions) a slow velocity step can fall
+       below float resolution: the value then stalls a few ulps from the target
+       while drag balances the spring, a velocity that never decays and would
+       animate forever. Snap such a stall within a magnitude-relative bound. */
+    f32 dist = fabsf(target - a->value);
+    b32 stalled = a->value == before && dt > 0 && dist < CORE_MAX(0.0005f, fabsf(target) * 1e-5f);
+    if ((dist < 0.0005f && fabsf(a->velocity) < 0.005f) || stalled) {
         a->value = target;
         a->velocity = 0;
     } else {

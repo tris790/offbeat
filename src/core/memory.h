@@ -58,6 +58,7 @@ typedef struct {
     u64 arena_committed;
     u64 heap_live;
     u64 heap_peak;
+    u64 heap_blocks;   /* live tracked allocations */
 } Core_MemStats;
 Core_MemStats core_mem_stats(void);
 

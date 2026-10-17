@@ -703,6 +703,15 @@ static u64 claim_locked(Downloads *d) {
     return 0;
 }
 
+/* Whether claim_locked() may succeed later without any broadcast: a queued
+   job held back only by the start stagger or its retry backoff. Caller holds mu. */
+static b32 game_download_timer_pending_locked(Downloads *d) {
+    if (d->quit || d->paused || !d->dest_dir[0] || !d->tools.ytdlp || !d->tools.ffmpeg) return false;
+    for (u32 i = 0; i < d->count; i++)
+        if (d->slots[i].j.state == DL_QUEUED) return true;
+    return false;
+}
+
 /* ---- job bookkeeping (each takes the lock itself) ---- */
 
 static void job_progress(Downloads *d, u64 uid, u32 phase, f32 progress) {
@@ -1211,7 +1220,11 @@ static void worker_main(void *arg) {
     while (!d->quit) {
         u64 uid = claim_locked(d);
         if (!uid) {
-            platform_cond_wait_timeout(&d->cv, &d->mu, 0.5);
+            /* Start staggering and retry backoff are timers that only matter
+               while a startable job waits; otherwise every state change that
+               could make a job claimable broadcasts, so sleep until then. */
+            if (game_download_timer_pending_locked(d)) platform_cond_wait_timeout(&d->cv, &d->mu, 0.5);
+            else platform_cond_wait(&d->cv, &d->mu);
             continue;
         }
         w->uid = uid;

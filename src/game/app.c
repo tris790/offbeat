@@ -1481,10 +1481,7 @@ static List_View list_begin(App *app, Scroll *sc, u64 id, vec2 pos, vec2 size, u
     }
 
     sc->target = CORE_CLAMP(sc->target, 0.0f, max_scroll);
-    f32 k = 1.0f - expf(-ui->dt * 20.0f);
-    sc->pos += (sc->target - sc->pos) * k;
-    if (fabsf(sc->target - sc->pos) < 0.25f) sc->pos = sc->target;
-    else ui->animating = true;
+    if (core_approach(&sc->pos, sc->target, 1.0f - expf(-ui->dt * 20.0f), 0.25f)) ui->animating = true;
     sc->idle += ui->dt;
     f32 show = (sc->idle < 0.9f || bar.hovered || bar.held || ui_mouse_in(ui, vec2_make(track_pos.x - S(10), pos.y), vec2_make(S(20), size.y))) ? 1.0f : 0.0f;
     sc->bar_t = ui_ease(ui, ui_idx(id, 0xBB), max_scroll > 0 ? show : 0.0f, 10.0f);

@@ -36,6 +36,24 @@ int main(void)
     TEST_CHECK(near(core_ease_out_cubic(0.5f), 0.875f));
     TEST_CHECK(near(core_ease_out_cubic(1.5f), 1));
 
+    /* exponential approach settles, including where the step rounds away
+       (a 240 Hz frame easing a 3000 px caret or a 1.2M px scroll offset) */
+    {
+        f32 v = 0.0f;
+        TEST_CHECK(core_approach(&v, 1.0f, 0.5f, 0.0005f) && near(v, 0.5f));
+        u32 frames = 0;
+        while (core_approach(&v, 1.0f, 0.5f, 0.0005f) && frames < 100) frames++;
+        TEST_CHECK(v == 1.0f && frames < 20);
+        f32 caret = 3100.0f, scroll = 0.0f;
+        f32 k_caret = 1.0f - expf(-30.0f / 240.0f), k_scroll = 1.0f - expf(-20.0f / 240.0f);
+        for (frames = 0; core_approach(&caret, 3000.3f, k_caret, 0.0005f) && frames < 10000; frames++) {}
+        TEST_CHECK(caret == 3000.3f && frames < 1000);
+        for (frames = 0; core_approach(&scroll, 1200000.3f, k_scroll, 0.25f) && frames < 10000; frames++) {}
+        TEST_CHECK(scroll == 1200000.3f && frames < 1000);
+        f32 still = 5.0f;
+        TEST_CHECK(core_approach(&still, 6.0f, 0.0f, 0.0005f) && still == 5.0f); /* dt == 0: no snap */
+    }
+
     vec3 rotated = quat_rotate_vec3(quat_from_axis_angle(vec3_make(0, 0, 1), CORE_PI * 0.5f), vec3_make(1, 0, 0));
     TEST_CHECK(vec3_near(rotated, vec3_make(0, 1, 0)));
 
